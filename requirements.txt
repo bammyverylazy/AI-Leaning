@@ -1,0 +1,7 @@
+numpy
+pandas
+matplotlib
+scikit-learn
+jupyter
+# ส่วนที่ 9 ของ notebook 04 (ทางเลือก): pip install torch  (ดูคำสั่งที่ตรงกับเครื่องที่ https://pytorch.org/get-started)
+# ทางเลือก (notebook 02 ส่วนที่ 5): pip install lightgbm catboost
