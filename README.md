@@ -1,23 +1,39 @@
-# Sign Language Learning Project
+## Description
 
-Goal: webcam -> hand -> skeleton -> sign -> text -> speech. Learning first.
+ศึกษาและพัฒนาต้นแบบระบบรู้จำภาษามือจากวิดีโอหรือกล้อง โดยใช้ Deep Learning ร่วมกับ Pose / Hand Landmark Detection เพื่อสกัดตำแหน่งร่างกายและมือ แล้วนำลำดับการเคลื่อนไหวไปจำแนกเป็นคำภาษามือ
 
-## Setup
-```bash
-python -m venv venv
-# Windows: venv\Scripts\activate     Mac/Linux: source venv/bin/activate
-pip install -r requirements.txt
-```
-Download `hand_landmarker.task` (MediaPipe Hand Landmarker, from the Google AI Edge docs) into `models/`.
-Put a photo of your hand at `data/myhand.jpg`.
+แนวทางเริ่มต้นที่เสนอคือใช้โมเดลตรวจจับ landmarks สำเร็จรูป แล้วฝึกโมเดลรู้จำลำดับ เช่น LSTM หรือ GRU เป็น baseline ก่อนทดลองสถาปัตยกรรมที่ซับซ้อนขึ้น โดยแยกขั้นตอนตรวจจับท่าทางออกจากการตีความภาษามืออย่างชัดเจน
 
-## Order
-| Phase | Notebook | You learn |
-|---|---|---|
-| 0 | 01_python_cv_basics | pixels, arrays, OpenCV |
-| 1 | 04_hand_detection | box, confidence, IoU |
-| 1 | 05_hand_keypoints | skeleton, 21 numbers, normalization, live webcam |
-| 2 | 03_dataset_exploration | record data, imbalance, leakage, splits |
-| 2 | 06_baseline_classifier | KNN / LogReg, confusion matrix |
+## ขอบเขตต้นแบบที่เสนอ
 
-Folders: `data/` (signs/, processed/, splits.csv), `models/`, `experiments/`.
+- เริ่มจากการรู้จำคำภาษามือแบบแยกคำ (isolated sign recognition) ไม่ใช่การแปลประโยคต่อเนื่อง
+- ระบุภาษามือเป้าหมายและชุดคำก่อนจัดเตรียมข้อมูล
+- พิจารณาข้อมูลมือ ร่างกาย และใบหน้า ไม่จำกัดเฉพาะ body pose
+- แสดงผลคำที่คาดการณ์และค่าความมั่นใจ พร้อมรองรับกรณีที่โมเดลไม่มั่นใจ
+
+## แนวทางดำเนินงาน
+
+- เลือกหรือรวบรวมวิดีโอพร้อม label ตรวจสอบสิทธิ์การใช้งานและความยินยอมของผู้ร่วมบันทึก
+- สกัด landmarks รายเฟรม จัดการเฟรมที่ตรวจจับไม่ได้ และ normalize ตำแหน่งให้เหมาะกับการฝึก
+- แบ่ง train / validation / test ตามผู้แสดงภาษามือ เพื่อทดสอบกับคนที่โมเดลไม่เคยเห็นและลด data leakage
+- ฝึก baseline จากลำดับ landmarks แล้ววิเคราะห์คำที่สับสนกัน
+- ประเมินด้วย accuracy, macro-F1, confusion matrix และ latency บนอุปกรณ์เป้าหมาย
+- สร้างเดโมจากวิดีโอหรือกล้อง พร้อมบันทึกข้อจำกัดด้านแสง มุมกล้อง การบังมือ และความแตกต่างระหว่างผู้ใช้
+
+## ผลลัพธ์ที่คาดหวัง
+
+- Pipeline เตรียมข้อมูลและสกัด landmarks ที่ทำซ้ำได้
+- โมเดล baseline และรายงานผลทดลอง
+- เดโมรู้จำคำภาษามือ พร้อมข้อจำกัดและแนวทางต่อยอด
+
+## Resources
+
+MediaPipe Holistic Landmarker API: เอกสารสำหรับทดลองสกัด landmarks ร่วมกันจากร่างกาย มือ และใบหน้า
+ASL Citizen — Dataset Description: ชุดข้อมูลคำภาษามืออเมริกันแบบแยกคำ พร้อมรายละเอียดข้อมูลสำหรับศึกษาการออกแบบการทดลอง
+WLASL — Research Paper: งานวิจัยและชุดข้อมูลสำหรับ word-level ASL recognition ใช้ศึกษา benchmark และวิธีเปรียบเทียบโมเดล
+
+# ประเด็นที่ต้องยืนยันก่อนเริ่ม
+
+[] ภาษามือเป้าหมาย: ไทยหรือ ASL และชุดคำที่ต้องการรองรับ
+[] แหล่งข้อมูล สิทธิ์ใช้งาน และอุปกรณ์สำหรับทดสอบ
+[] หากเลือกภาษามือไทย ให้ใช้ชุดข้อมูลที่ตรงกับภาษาเป้าหมาย โดย resources ของ ASL ข้างต้นเป็นข้อมูลอ้างอิง ไม่ใช่ชุดข้อมูลเป้าหมายโดยอัตโนมัติ
