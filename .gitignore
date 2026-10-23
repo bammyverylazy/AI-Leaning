@@ -1,0 +1,10 @@
+.venv
+.venv-1
+project/data/raw/
+*.csv
+*.task
+*.txt
+*.npy
+*.npz
+*.mp4
+*.pt
