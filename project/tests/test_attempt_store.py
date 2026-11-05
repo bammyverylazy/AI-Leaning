@@ -217,6 +217,88 @@ class RecognitionAttemptStoreTests(unittest.TestCase):
         self.assertEqual(rows[0]["canonical_label"], "DOG1")
         self.assertEqual(rows[0]["session_id"], "legacy")
 
+    def test_session_lifecycle_attempt_trace_and_no_prediction_status(self):
+        session_id = self.store.start_session(
+            "session-1",
+            model_version="model-sha",
+            vocabulary_version="vocab-sha",
+            configuration={"threshold": 0.45},
+        )
+        attempt_id = self.store.begin_attempt(
+            session_id=session_id,
+            target_label="AXE1",
+            model_version="model-sha",
+            preprocessing_version="pre-v1",
+        )
+        attempt = self.store.get_attempt(attempt_id)
+        self.assertEqual(attempt["status"], "in_progress")
+        self.assertEqual(attempt["ground_truth_label"], None)
+        self.assertEqual(attempt["demo_video_id"], "")
+
+        self.assertEqual(
+            self.store.finish_attempt(
+                attempt_id,
+                status="no_prediction",
+                warning="No stable sign was confirmed",
+            ),
+            "no_prediction",
+        )
+        self.assertEqual(
+            self.store.get_attempt(attempt_id)["status"],
+            "no_prediction",
+        )
+        self.assertEqual(self.store.pending_attempts(), [])
+        self.assertEqual(
+            [row["event_type"] for row in self.store.attempt_events(attempt_id)],
+            [
+                "session_started",
+                "target_selected",
+                "attempt_started",
+                "recognition_started",
+                "attempt_completed",
+                "attempt_saved",
+            ],
+        )
+        self.assertEqual(self.store.end_session(session_id), "completed")
+        self.assertEqual(self.store.get_session(session_id)["status"], "completed")
+
+    def test_attempt_cancellation_and_interrupted_session_are_explicit(self):
+        session_id = self.store.start_session(
+            "session-interrupted",
+            model_version="model",
+            vocabulary_version="vocab",
+            configuration={},
+        )
+        attempt_id = self.store.begin_attempt(
+            session_id=session_id,
+            target_label="AXE1",
+            model_version="model",
+            preprocessing_version="pre-v1",
+        )
+        self.store.finish_attempt(
+            attempt_id,
+            status="cancelled",
+            error="user cancelled",
+        )
+        self.assertEqual(self.store.get_attempt(attempt_id)["status"], "cancelled")
+        self.assertEqual(self.store.end_session(session_id, "interrupted"), "interrupted")
+
+    def test_incomplete_attempt_cannot_be_verified(self):
+        session_id = self.store.start_session(
+            "session-pending",
+            model_version="model",
+            vocabulary_version="vocab",
+            configuration={},
+        )
+        attempt_id = self.store.begin_attempt(
+            session_id=session_id,
+            target_label="AXE1",
+            model_version="model",
+            preprocessing_version="pre-v1",
+        )
+        with self.assertRaisesRegex(ValueError, "completed attempts"):
+            self.store.verify_ground_truth(attempt_id, "AXE1", "reviewer")
+
 
 if __name__ == "__main__":
     unittest.main()

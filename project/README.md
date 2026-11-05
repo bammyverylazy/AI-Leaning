@@ -304,16 +304,16 @@ Speech uses the computer's installed Windows **System.Speech/SAPI** English voic
 
 ### Guided testing
 
-Testing mode is a page in the same application. Choose a verified target, replay its embedded reference video as needed, then select **Start attempt**. The webcam opens in the adjacent preview and the attempt starts explicitly; finish it to display the prediction and confidence and save its metadata. Attempts remain unverified until an independent reviewer records ground truth. If a target is changed while a camera is active, stop that camera first; switching away during an active test asks before discarding the unfinished attempt.
+Testing mode is a page in the same application. Choose a target from the checkpoint vocabulary. If a verified reference video is available, replay it in the embedded preview; otherwise, the attempt can still proceed and the report marks it as having no reference. Missing references do not disable target selection, including after the camera stops. Select **Start attempt**, perform one sign, then select **Finish attempt**. Live predictions pass through the same MediaPipe, preprocessing, model, and subtitle stabilizer as Demo mode; only a stabilized prediction is saved as a model result. Attempts are initialized in SQLite before recognition and remain unverified until an independent reviewer records the actual performed sign. Short, cancelled, interrupted, errored, and no-prediction attempts are retained with explicit statuses and excluded from verified accuracy.
 
 Demonstrations are intentionally managed separately from the ASL Citizen training videos:
 
 - Add reviewed MP4/H.264 files under `data/sign_demos/videos/<LABEL>/`.
 - Fill that label's placeholder row in `data/sign_demos/manifest.csv` with the exact checkpoint label, a unique `video_id`, a version, the MP4 `filename`, its `source`, `verification_status=verified`, the independently checked `verified_meaning`, reviewer `notes`, and `is_current=true`.
 - Keep old versioned files and rows when replacing a video: mark the previous row `is_current=false` and add a new current row. Use a clear frontal view with the hands and relevant upper body visible. Use MP4/H.264; the file must be decodable by the installed OpenCV build.
-- The runtime checks that a video opens and contains readable frames. The runtime will not treat raw training clips as demonstrations. Missing, unverified, or corrupted videos are listed in `reports/missing_sign_demos.csv`, and cannot be assigned as a test target. In the app, use **Open missing-demo list** to inspect labels still awaiting clips.
+- The runtime checks that a video opens and contains readable frames. The runtime will not treat raw training clips as demonstrations. Missing, unverified, or corrupted videos are listed in `reports/missing_sign_demos.csv`. They are unavailable as references but do not prevent those labels from being tested. If that CSV is locked or unwritable, the app continues and reports the CSV error in Testing Mode; close the report in other applications and retry **Open missing-demo list** to regenerate it.
 
-At present, **none of the 50 labels has a curated, verified demonstration video**. ASL Citizen clips exist as labeled training examples, but have not been reviewed as teaching references. The full missing-label list is in `reports/missing_sign_demos.csv`.
+At present, **none of the 50 labels has a curated, verified demonstration video**. ASL Citizen clips exist as labeled training examples, but have not been reviewed as teaching references. Testing remains usable without reference videos; the full missing-label list is in `reports/missing_sign_demos.csv`.
 
 Start the app in guided testing mode, or select Testing from Demo mode:
 
@@ -322,18 +322,26 @@ python src\demo.py --mode testing --ckpt models\gru_seed3.pt
 python src\demo.py --mode testing --ckpt models\gru_seed3.pt --target AXE1
 ```
 
-`--target` selects an initial label only when that label has a verified, readable demonstration video. If no verified demos are available, Testing mode explains why and links to the missing-demo report; Demo mode remains available for webcam practice.
+`--target` selects an initial label from the model vocabulary whether or not a reference video exists.
 
-Each completed webcam attempt is stored in `data/recognition_attempts.sqlite3`. Target, canonical prediction, original checkpoint label/class index, top-3 scores, model SHA-256, preprocessing version, inference latency, demo watched duration, session ID, and timestamp are recorded separately. Ground truth remains empty and correctness remains `unverified` until an independent reviewer supplies it. Existing databases are migrated without deleting prior attempts:
+Testing sessions and attempts are stored in `data/recognition_attempts.sqlite3`. A session records start/end status, model and vocabulary hashes, and the active configuration. Each attempt has a durable ID, target, optional reference video, start/end/duration, explicit status, original model label/class index, canonical prediction, top-3 scores, confidence, inference latency, and an event trace. Ground truth remains empty and correctness remains `unverified` until an independent reviewer supplies the actual performed sign. Existing databases are migrated without deleting prior attempts.
 
 ```powershell
 python src\manage_attempts.py pending
 python src\manage_attempts.py verify --attempt-id 1 --ground-truth AXE1 --verified-by reviewer_id
 python src\manage_attempts.py correct --attempt-id 1 --ground-truth DOG1 --verified-by reviewer_id --reason "Second independent review"
 python src\manage_attempts.py history --attempt-id 1
+python src\manage_attempts.py sessions
+python src\manage_attempts.py attempts --session-id SESSION_ID
+python src\manage_attempts.py trace --attempt-id 1
+python src\manage_attempts.py report --session-id SESSION_ID
 ```
 
-Corrections append an audit record and preserve the original model prediction. The correctness status is computed from the reviewed ground truth and prediction, never by assuming that the target is ground truth or that a matching prediction proves the performed sign was correct. Canonical display labels do not change checkpoint vocabulary order or class indices: only metadata-confirmed aliases such as `WHATFOR1/2/3` are combined; labels with distinct sign identities keep their suffix as a visible variant.
+In Testing mode, **History / verify** opens saved attempts and their event traces and accepts independently observed ground truth; **Testing report** displays the current session’s report. `manage_attempts.py report` defaults to the latest session. Corrections append an audit record and preserve the original model prediction. **Target Agreement** compares prediction with requested target and is not ground-truth accuracy. **Verified Top-1/Top-K Accuracy** uses only completed, valid, reviewed attempts and displays its denominator; Top-3/Top-5 are omitted when that depth is not stored. The confusion matrix is withheld below five verified samples. The report flags small samples, unverified attempts, and missing reference videos and notes that no performance recording or tester identity is stored.
+
+User-facing metrics compare canonical labels. Only the metadata-confirmed `WHATFOR1/2/3` aliases are combined as `WHAT FOR`; their original checkpoint class indices remain stored, and top-K is deduplicated after canonicalization. Distinct signs such as `CHRISTMAS1/2` remain separate canonical variants. This means canonical accuracy is an alias-level metric, not strict checkpoint-class accuracy.
+
+Add `--debug-testing` to show the current session/attempt, target, candidate/stable prediction, confidence, stabilizer state, inference latency, and persistence result in the Testing page. This is separate from `--debug-performance`, which reports rolling pipeline timing.
 
 ---
 

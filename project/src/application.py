@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import collections
 import hashlib
+import json
 import os
 import queue
+import sqlite3
 import threading
 import time
 import uuid
@@ -19,7 +21,7 @@ import numpy as np
 import tkinter as tk
 import torch
 from PIL import Image, ImageTk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 import config as C
 from attempt_store import RecognitionAttemptStore
@@ -30,6 +32,7 @@ from model import SeqClassifier
 from sign_demo_catalog import SignDemo, load_catalog, write_missing_report
 from speech import SpeechService, spoken_text
 from subtitle import State, SubtitleManager
+from testing_metrics import build_report, format_report
 
 
 BACKGROUND = "#101010"
@@ -325,6 +328,8 @@ class RecognitionWorker(threading.Thread):
         demo_watch_duration: float = 0.0,
         model_version: str,
         session_id: str,
+        store: RecognitionAttemptStore | None = None,
+        attempt_id: int | None = None,
     ) -> None:
         super().__init__(name="asl-recognition", daemon=True)
         self.mode = mode
@@ -340,8 +345,10 @@ class RecognitionWorker(threading.Thread):
         self.demo_watch_duration = demo_watch_duration
         self.model_version = model_version
         self.session_id = session_id
+        self.store = store
+        self.current_attempt_id = attempt_id
         self._stop_event = threading.Event()
-        self._commands: queue.Queue[str] = queue.Queue()
+        self._commands: queue.Queue[tuple[str, int | None]] = queue.Queue()
         self._frame_lock = threading.Lock()
         self._latest_frame: np.ndarray | None = None
         self._frame_version = 0
@@ -359,6 +366,8 @@ class RecognitionWorker(threading.Thread):
         self._last_rendered_commit = 0
         self._candidate_label = ""
         self._candidate_started_at: float | None = None
+        self._stable_predictions: list[CanonicalPrediction] = []
+        self._attempt_inference_latencies: list[float] = []
         self._prediction_interval = 2
         self._frames: queue.Queue[tuple[np.ndarray, float]] = queue.Queue(
             maxsize=1
@@ -382,8 +391,8 @@ class RecognitionWorker(threading.Thread):
         with self._commit_lock:
             return self._commit_sequence
 
-    def command(self, value: str) -> None:
-        self._commands.put(value)
+    def command(self, value: str, attempt_id: int | None = None) -> None:
+        self._commands.put((value, attempt_id))
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -412,7 +421,7 @@ class RecognitionWorker(threading.Thread):
             self.capture.start()
             with make_landmarker() as landmarker:
                 while not self._stop_event.is_set():
-                    self._process_commands(recording_frames)
+                    self._process_commands(recording_frames, frame_buffer)
                     if self._stop_event.is_set():
                         break
                     try:
@@ -447,7 +456,9 @@ class RecognitionWorker(threading.Thread):
                         max(0.0, (frame_started - captured_at) * 1000),
                     )
 
-                    if self.mode == "demo":
+                    if self.mode == "demo" or (
+                        self.mode == "testing" and self.recording
+                    ):
                         stage_started = time.perf_counter()
                         rgb = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
                         image = mp.Image(
@@ -473,51 +484,62 @@ class RecognitionWorker(threading.Thread):
                             (time.perf_counter() - landmark_started) * 1000,
                         )
                         frame_buffer.append(landmarks)
+                        if self.mode == "testing":
+                            recording_frames.append(landmarks)
+                            self.events.put(
+                                ("recording_progress", len(recording_frames))
+                            )
                         if frame_count % self._prediction_interval == 0:
                             self._recognize_live(frame_buffer, landmarks)
-                        display_landmarks = landmarks.copy()
-                        display_landmarks[:, 0] = (
-                            offset_x + display_width * (1.0 - display_landmarks[:, 0])
-                        ) / 1280
-                        display_landmarks[:, 1] = (
-                            offset_y + display_height * display_landmarks[:, 1]
-                        ) / 720
-                        self._draw_demo_overlay(
-                            display_frame,
-                            display_landmarks,
-                            (
-                                float(np.mean(self._fps_samples))
-                                if self._fps_samples else 0.0
-                            ),
-                            self.performance.mean("mediapipe"),
-                            self.performance.mean("model_inference"),
-                        )
-                    elif self.recording:
-                        rgb = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
-                        image = mp.Image(
-                            image_format=mp.ImageFormat.SRGB,
-                            data=np.ascontiguousarray(rgb),
-                        )
-                        now = time.perf_counter()
-                        timestamp_ms = max(
-                            last_timestamp + 1,
-                            int((now - started_at) * 1000),
-                        )
-                        last_timestamp = timestamp_ms
-                        recording_frames.append(
-                            result_to_array(
-                                landmarker.detect_for_video(image, timestamp_ms)
+                        if self.mode == "demo":
+                            display_landmarks = landmarks.copy()
+                            display_landmarks[:, 0] = (
+                                offset_x
+                                + display_width * (1.0 - display_landmarks[:, 0])
+                            ) / 1280
+                            display_landmarks[:, 1] = (
+                                offset_y + display_height * display_landmarks[:, 1]
+                            ) / 720
+                            self._draw_demo_overlay(
+                                display_frame,
+                                display_landmarks,
+                                (
+                                    float(np.mean(self._fps_samples))
+                                    if self._fps_samples else 0.0
+                                ),
+                                self.performance.mean("mediapipe"),
+                                self.performance.mean("model_inference"),
                             )
-                        )
-                        self.events.put(("recording_progress", len(recording_frames)))
                     self._publish_frame(display_frame)
                     self.performance.add(
                         "frame_processing",
                         (time.perf_counter() - frame_started) * 1000,
                     )
         except Exception as exc:
+            if self.mode == "testing" and self.current_attempt_id is not None:
+                try:
+                    self._finish_active_attempt(
+                        "error", error=f"{type(exc).__name__}: {exc}"
+                    )
+                except Exception as save_error:
+                    self.events.put(
+                        (
+                            "worker_error",
+                            f"{exc}; additionally failed to save attempt status: {save_error}",
+                        )
+                    )
             self.events.put(("worker_error", str(exc)))
         finally:
+            if self.mode == "testing" and self.current_attempt_id is not None:
+                try:
+                    self._finish_active_attempt(
+                        "interrupted",
+                        error="Camera worker stopped before the attempt was completed.",
+                    )
+                except Exception as exc:
+                    self.events.put(
+                        ("worker_error", f"Could not persist interrupted attempt: {exc}")
+                    )
             self._stop_event.set()
             if self.capture.is_alive():
                 self.capture.join()
@@ -530,10 +552,14 @@ class RecognitionWorker(threading.Thread):
             self._latest_frame = frame
             self._frame_version += 1
 
-    def _process_commands(self, frames: list[np.ndarray]) -> None:
+    def _process_commands(
+        self,
+        frames: list[np.ndarray],
+        frame_buffer: collections.deque[np.ndarray],
+    ) -> None:
         while True:
             try:
-                command = self._commands.get_nowait()
+                command, attempt_id = self._commands.get_nowait()
             except queue.Empty:
                 return
             if command == "stop":
@@ -547,10 +573,22 @@ class RecognitionWorker(threading.Thread):
                 self.events.put(("subtitle_cleared", self.commit_sequence))
                 self.events.put(("subtitle", ""))
             elif command == "start_attempt" and self.mode == "testing":
+                if attempt_id is None and self.current_attempt_id is None:
+                    self.events.put(("worker_error", "No initialized attempt is attached."))
+                    continue
+                if attempt_id is not None:
+                    self.current_attempt_id = attempt_id
                 frames.clear()
+                frame_buffer.clear()
+                self.subtitle_manager.clear()
+                self._latest_commit = None
+                self._candidate_label = ""
+                self._candidate_started_at = None
+                self._stable_predictions = []
+                self._attempt_inference_latencies = []
                 with self._recording_lock:
                     self._recording = True
-                self.events.put(("attempt_started", None))
+                self.events.put(("attempt_started", self.current_attempt_id))
             elif command == "finish_attempt" and self.mode == "testing":
                 with self._recording_lock:
                     was_recording = self._recording
@@ -581,10 +619,10 @@ class RecognitionWorker(threading.Thread):
             with torch.no_grad():
                 probabilities = torch.softmax(self.model(features), dim=1)[0]
             predictions = aggregate_predictions(probabilities, self.vocab, top_k=3)
-            self.performance.add(
-                "model_inference",
-                (time.perf_counter() - classifier_started) * 1000,
-            )
+            inference_ms = (time.perf_counter() - classifier_started) * 1000
+            self.performance.add("model_inference", inference_ms)
+            if self.mode == "testing" and self.recording:
+                self._attempt_inference_latencies.append(inference_ms)
         self._display_predictions = predictions
         if predictions:
             best = predictions[0]
@@ -614,6 +652,46 @@ class RecognitionWorker(threading.Thread):
             )
             self.events.put(("prediction", (predictions, hands_present)))
             if newly_committed is not None:
+                committed_prediction = next(
+                    item
+                    for item in predictions
+                    if item.canonical_label == newly_committed
+                )
+                if self.mode == "testing" and self.current_attempt_id is not None:
+                    self._stable_predictions = predictions
+                    if self.store is None:
+                        raise RuntimeError("Testing attempt storage is unavailable")
+                    self.store.record_event(
+                        self.session_id,
+                        "stable_prediction_confirmed",
+                        attempt_id=self.current_attempt_id,
+                        details={
+                            "canonical_label": committed_prediction.canonical_label,
+                            "original_model_label": committed_prediction.original_model_label,
+                            "class_index": committed_prediction.class_index,
+                            "confidence": committed_prediction.confidence,
+                            "top_k": [
+                                {
+                                    "canonical_label": item.canonical_label,
+                                    "original_model_label": item.original_model_label,
+                                    "class_index": item.class_index,
+                                    "confidence": item.confidence,
+                                }
+                                for item in predictions
+                            ],
+                        },
+                    )
+                    self.events.put(
+                        (
+                            "stable_prediction",
+                            {
+                                "attempt_id": self.current_attempt_id,
+                                "prediction": committed_prediction,
+                                "predictions": predictions,
+                                "latency_ms": inference_ms,
+                            },
+                        )
+                    )
                 with self._commit_lock:
                     self._commit_sequence += 1
                     sequence = self._commit_sequence
@@ -648,6 +726,27 @@ class RecognitionWorker(threading.Thread):
                 (time.perf_counter() - stabilization_started) * 1000,
             )
             self.events.put(("prediction", ([], hands_present)))
+        if self.mode == "testing" and getattr(self.args, "debug_testing", False):
+            candidate = predictions[0] if predictions else None
+            stable = self._stable_predictions[0] if self._stable_predictions else None
+            self.events.put(
+                (
+                    "debug_state",
+                    {
+                        "session_id": self.session_id,
+                        "attempt_id": self.current_attempt_id,
+                        "target": self.target_label,
+                        "attempt_state": (
+                            "in_progress" if self.current_attempt_id is not None else "idle"
+                        ),
+                        "candidate": candidate.canonical_label if candidate else "none",
+                        "stable": stable.canonical_label if stable else "none",
+                        "confidence": candidate.confidence if candidate else 0.0,
+                        "stabilization": self.subtitle_manager.state.name,
+                        "latency_ms": self.performance.mean("model_inference"),
+                    },
+                )
+            )
 
     def _draw_demo_overlay(
         self,
@@ -768,31 +867,51 @@ class RecognitionWorker(threading.Thread):
             )
 
     def _finish_attempt(self, frames: list[np.ndarray]) -> None:
+        if self.current_attempt_id is None:
+            self.events.put(("worker_error", "No active attempt can be completed."))
+            return
+        attempt_id = self.current_attempt_id
         if len(frames) < 8:
-            self.events.put(("attempt_too_short", len(frames)))
+            self._finish_active_attempt(
+                "invalid",
+                error=f"Attempt contained only {len(frames)} usable frames.",
+            )
+            self.events.put(
+                (
+                    "attempt_result",
+                    {
+                        "attempt_id": attempt_id,
+                        "status": "invalid",
+                        "frames": len(frames),
+                        "target_label": self.target_label,
+                    },
+                )
+            )
             return
-        if self.demo is None or self.target_label is None:
-            self.events.put(("worker_error", "A verified target demonstration is required."))
+        if not self._stable_predictions:
+            self._finish_active_attempt(
+                "no_prediction",
+                warning="No prediction reached the configured stabilization threshold.",
+            )
+            self.events.put(
+                (
+                    "attempt_result",
+                    {
+                        "attempt_id": attempt_id,
+                        "status": "no_prediction",
+                        "frames": len(frames),
+                        "target_label": self.target_label,
+                    },
+                )
+            )
             return
-        started = time.perf_counter()
-        positions, present = preprocess_sequence(np.stack(frames))
-        features = torch.from_numpy(build_features(positions, present))[None]
-        with torch.no_grad():
-            probabilities = torch.softmax(self.model(features), dim=1)[0]
-        predictions = aggregate_predictions(probabilities, self.vocab, top_k=3)
+        predictions = self._stable_predictions
         best = predictions[0]
-        store = RecognitionAttemptStore(Path(self.args.attempt_db))
-        attempt_id = store.create_attempt(
-            target_label=self.target_label,
-            demo_video_id=self.demo.video_id,
-            demo_video_version=self.demo.version,
-            demo_watched=self.demo_watched,
-            demo_watch_duration=self.demo_watch_duration,
+        self._finish_active_attempt(
+            "completed",
             predicted_label=best.canonical_label,
-            confidence=best.confidence,
-            session_id=self.session_id,
             original_model_label=best.original_model_label,
-            canonical_label=best.canonical_label,
+            canonical_label_value=best.canonical_label,
             class_index=best.class_index,
             top_k_predictions=[
                 {
@@ -804,20 +923,60 @@ class RecognitionWorker(threading.Thread):
                 }
                 for prediction in predictions
             ],
-            model_version=self.model_version,
-            preprocessing_version=C.PREPROCESSING_VERSION,
-            inference_latency_ms=(time.perf_counter() - started) * 1000,
+            confidence=best.confidence,
+            inference_latency_ms=(
+                statistics.fmean(self._attempt_inference_latencies)
+                if self._attempt_inference_latencies else None
+            ),
         )
         self.events.put(
             (
                 "attempt_result",
                 {
                     "attempt_id": attempt_id,
+                    "status": "completed",
                     "predictions": predictions,
                     "frames": len(frames),
                     "target_label": self.target_label,
                 },
             )
+        )
+
+    def _finish_active_attempt(
+        self,
+        status: str,
+        *,
+        error: str | None = None,
+        warning: str | None = None,
+        predicted_label: str = "",
+        original_model_label: str = "",
+        canonical_label_value: str = "",
+        class_index: int | None = None,
+        top_k_predictions: list[dict] | None = None,
+        confidence: float = 0.0,
+        inference_latency_ms: float | None = None,
+    ) -> None:
+        attempt_id = self.current_attempt_id
+        if attempt_id is None:
+            return
+        if self.store is None:
+            raise RuntimeError("Testing attempt storage is unavailable")
+        saved_status = self.store.finish_attempt(
+            attempt_id,
+            status=status,
+            predicted_label=predicted_label,
+            original_model_label=original_model_label,
+            canonical_label_value=canonical_label_value,
+            class_index=class_index,
+            top_k_predictions=top_k_predictions,
+            confidence=confidence,
+            inference_latency_ms=inference_latency_ms,
+            error=error,
+            warning=warning,
+        )
+        self.current_attempt_id = None
+        self.events.put(
+            ("attempt_persisted", {"attempt_id": attempt_id, "status": saved_status})
         )
 
 
@@ -832,10 +991,14 @@ class ASLApplication:
 
         self.model, self.vocab = self._load_model(Path(args.ckpt))
         self.model_version = hashlib.sha256(Path(args.ckpt).read_bytes()).hexdigest()
-        self.session_id = uuid.uuid4().hex
+        self.vocabulary_version = hashlib.sha256(
+            "\n".join(self.vocab).encode("utf-8")
+        ).hexdigest()
+        self.session_id: str | None = None
+        self.attempt_store = RecognitionAttemptStore(Path(args.attempt_db))
         manifest_path = Path(args.demo_manifest)
         self.catalog, self.missing_demos = load_catalog(self.vocab, manifest_path)
-        write_missing_report(self.missing_demos)
+        self._missing_report_error = self._update_missing_report()
 
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.subtitle_manager = SubtitleManager(
@@ -885,8 +1048,16 @@ class ASLApplication:
         if initial_mode == "testing":
             self._select_initial_target()
         self._show_mode(initial_mode)
-        if self._initial_target_error:
-            self.status_var.set(self._initial_target_error)
+        status_messages = [
+            message
+            for message in (
+                self._initial_target_error,
+                self._missing_report_error,
+            )
+            if message
+        ]
+        if status_messages:
+            self.status_var.set(" · ".join(status_messages))
 
     @staticmethod
     def _load_model(checkpoint_path: Path) -> tuple[SeqClassifier, list[str]]:
@@ -1036,12 +1207,37 @@ class ASLApplication:
         ttk.Label(heading, text="Guided testing", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
+        history_button = ttk.Button(
+            heading,
+            text="History / verify",
+            style="Secondary.TButton",
+            command=self._show_attempt_history,
+        )
+        history_button.grid(row=0, column=2, padx=(10, 0))
+        report_button = ttk.Button(
+            heading,
+            text="Testing report",
+            style="Secondary.TButton",
+            command=self._show_testing_report,
+        )
+        report_button.grid(row=0, column=3, padx=(8, 0))
         self.demo_count_label = ttk.Label(
             heading,
             text=f"{len(self.catalog)} of {len(self.vocab)} verified demos",
             style="Status.TLabel",
         )
         self.demo_count_label.grid(row=0, column=1, sticky="e")
+        self.debug_testing_label = ttk.Label(
+            page,
+            text="",
+            style="Muted.TLabel",
+            wraplength=950,
+            justify="left",
+        )
+        if getattr(self.args, "debug_testing", False):
+            self.debug_testing_label.grid(
+                row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+            )
 
         reference_card = self._card(page)
         reference_card.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
@@ -1053,7 +1249,7 @@ class ASLApplication:
         target_row = ttk.Frame(reference_card, style="Card.TFrame")
         target_row.grid(row=1, column=0, sticky="ew", pady=(10, 12))
         target_row.columnconfigure(1, weight=1)
-        ttk.Label(target_row, text="Choose a verified target", style="Muted.TLabel").grid(
+        ttk.Label(target_row, text="Choose a target", style="Muted.TLabel").grid(
             row=0, column=0, sticky="w", padx=(0, 9)
         )
         self.target_var = tk.StringVar()
@@ -1147,29 +1343,18 @@ class ASLApplication:
     def _populate_targets(self) -> None:
         values: list[str] = []
         for label in self.vocab:
-            if label not in self.catalog:
-                continue
             display = f"{canonical_label(label)}  ·  {label}"
             values.append(display)
             self._target_values[display] = label
         self.target_selector.configure(values=values)
-        if values:
-            self.target_selector.configure(state="readonly")
-        else:
+        if not values:
             self.target_selector.configure(state="disabled")
-            self.target_label_display.configure(text="No verified demo available")
-            self.reference_preview.show_placeholder(
-                "A verified reference video is required\nbefore a testing attempt can begin."
-            )
-            self.demo_video_status.configure(
-                text=(
-                    "No verified demonstration videos are in the catalog yet. "
-                    "Review the manifest and missing-demo report to add one."
-                )
-            )
-            self.missing_report_button.grid()
             self.replay_button.configure(state="disabled")
             self.start_attempt_button.configure(state="disabled")
+            self.target_label_display.configure(text="No target labels available")
+            self.reference_preview.show_placeholder("The checkpoint vocabulary is empty.")
+        else:
+            self.target_selector.configure(state="readonly")
 
     def _select_initial_target(self) -> None:
         if self.args.target:
@@ -1181,23 +1366,15 @@ class ASLApplication:
                 self.target_label_display.configure(text="Target not in vocabulary")
                 self.demo_video_status.configure(text=self._initial_target_error)
                 return
-            if wanted in self.catalog:
+            if wanted in self.vocab:
                 self._set_target_value(wanted)
                 return
-            self._initial_target_error = (
-                f"No verified demonstration video available for {wanted}: "
-                f"{self.missing_demos.get(wanted, 'unavailable')}."
-            )
-            self.target_label_display.configure(text=canonical_label(wanted))
+            self._initial_target_error = f"{wanted} is not in this model's vocabulary."
+            self.target_label_display.configure(text="Target not in vocabulary")
             self.demo_video_status.configure(text=self._initial_target_error)
-            self.reference_preview.show_placeholder(
-                "No verified demonstration video is available for this target."
-            )
             return
-        if self.catalog:
-            self._set_target_value(
-                next(label for label in self.vocab if label in self.catalog)
-            )
+        if self.vocab:
+            self._set_target_value(self.vocab[0])
 
     def _set_target_value(self, label: str) -> None:
         for value, raw_label in self._target_values.items():
@@ -1215,6 +1392,12 @@ class ASLApplication:
             self._set_target_value(self._selected_label)
             return
         self._selected_label = label
+        if self.session_id is not None:
+            self.attempt_store.record_event(
+                self.session_id,
+                "target_selected",
+                details={"target_label": label},
+            )
         self._load_target_video()
 
     def _load_target_video(self) -> None:
@@ -1223,8 +1406,21 @@ class ASLApplication:
         self._demo_watch_duration = 0.0
         if not self._selected_label:
             return
-        demo = self.catalog[self._selected_label]
         self.target_label_display.configure(text=canonical_label(self._selected_label))
+        demo = self.catalog.get(self._selected_label)
+        if demo is None:
+            reason = self.missing_demos.get(self._selected_label, "not catalogued")
+            self.reference_preview.show_placeholder(
+                "No verified reference video is available.\n"
+                "You may still perform this target; it will be reported as no-reference."
+            )
+            self.demo_video_status.configure(
+                text=f"Optional reference unavailable: {reason}"
+            )
+            self.replay_button.configure(state="disabled")
+            self.start_attempt_button.configure(state="normal")
+            self.missing_report_button.grid()
+            return
         self.reference_preview.show_placeholder("Press Play demonstration to watch.")
         self.demo_video_status.configure(
             text=f"Verified reference · version {demo.version} · replay as often as needed."
@@ -1234,16 +1430,278 @@ class ASLApplication:
         self.missing_report_button.grid_remove()
         self._open_demo_video(demo)
 
+    def _ensure_testing_session(self) -> None:
+        if self.session_id is not None:
+            return
+        self.session_id = uuid.uuid4().hex
+        self.attempt_store.start_session(
+            self.session_id,
+            model_version=self.model_version,
+            vocabulary_version=self.vocabulary_version,
+            configuration={
+                "checkpoint": Path(self.args.ckpt).name,
+                "confidence_threshold": self.args.thr,
+                "minimum_votes": self.args.min_votes,
+                "cooldown_seconds": self.args.cooldown,
+                "preprocessing_version": C.PREPROCESSING_VERSION,
+            },
+        )
+
+    def _create_test_attempt(self) -> int:
+        self._ensure_testing_session()
+        if self.session_id is None or not self._selected_label:
+            raise RuntimeError("A testing session and target label are required")
+        demo = self.catalog.get(self._selected_label)
+        return self.attempt_store.begin_attempt(
+            session_id=self.session_id,
+            target_label=self._selected_label,
+            demo_video_id=demo.video_id if demo else "",
+            demo_video_version=demo.version if demo else "",
+            demo_watched=self._demo_watched,
+            demo_watch_duration=self._demo_watch_duration,
+            model_version=self.model_version,
+            preprocessing_version=C.PREPROCESSING_VERSION,
+        )
+
+    def _show_testing_report(self) -> None:
+        try:
+            sessions = self.attempt_store.sessions()
+            session = None
+            attempts = []
+            if self.session_id is not None:
+                session = self.attempt_store.get_session(self.session_id)
+                attempts = self.attempt_store.attempts(self.session_id)
+            if not attempts:
+                for candidate in sessions:
+                    candidate_attempts = self.attempt_store.attempts(
+                        candidate["session_id"]
+                    )
+                    if candidate_attempts:
+                        session = candidate
+                        attempts = candidate_attempts
+                        break
+            text = format_report(build_report(attempts, session=session))
+        except (OSError, sqlite3.Error, KeyError, ValueError) as exc:
+            messagebox.showerror("Testing report", str(exc), parent=self.root)
+            return
+        window = tk.Toplevel(self.root)
+        window.title("Testing Mode report")
+        window.geometry("760x620")
+        body = tk.Text(
+            window,
+            wrap="word",
+            bg=CARD,
+            fg=INK,
+            insertbackground=INK,
+            font=("Consolas", 10),
+            padx=14,
+            pady=12,
+        )
+        body.pack(fill="both", expand=True)
+        body.insert("1.0", text)
+        body.configure(state="disabled")
+
+    def _show_attempt_history(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("Testing history and verification")
+        window.geometry("1080x680")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+        table = ttk.Treeview(
+            window,
+            columns=(
+                "session",
+                "time",
+                "target",
+                "prediction",
+                "status",
+                "ground_truth",
+                "confidence",
+            ),
+            show="headings",
+            selectmode="browse",
+        )
+        for column, title, width in (
+            ("session", "Session ID", 110),
+            ("time", "Started", 160),
+            ("target", "Target", 140),
+            ("prediction", "Prediction", 150),
+            ("status", "Status", 110),
+            ("ground_truth", "Verified ground truth", 180),
+            ("confidence", "Confidence", 90),
+        ):
+            table.heading(column, text=title)
+            table.column(column, width=width, stretch=column in {"target", "prediction"})
+        table.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
+        detail = tk.Text(
+            window,
+            height=14,
+            wrap="word",
+            bg=CARD,
+            fg=INK,
+            insertbackground=INK,
+            font=("Consolas", 9),
+            padx=12,
+            pady=10,
+        )
+        detail.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
+        window.rowconfigure(1, weight=1)
+        controls = ttk.Frame(window, padding=12)
+        controls.grid(row=2, column=0, sticky="ew")
+        controls.columnconfigure(0, weight=1)
+
+        def refresh(selected_id: int | None = None) -> None:
+            for item in table.get_children():
+                table.delete(item)
+            for row in self.attempt_store.attempts():
+                confidence = (
+                    f"{row['confidence']:.1%}" if row["predicted_label"] else "—"
+                )
+                table.insert(
+                    "",
+                    "end",
+                    iid=str(row["attempt_id"]),
+                    values=(
+                        row["session_id"],
+                        row["started_at"] or row["created_at"],
+                        row["target_label"],
+                        row["canonical_label"] or row["predicted_label"] or "—",
+                        row["status"],
+                        row["ground_truth_label"] or "unverified",
+                        confidence,
+                    ),
+                )
+            if selected_id is not None and table.exists(str(selected_id)):
+                table.selection_set(str(selected_id))
+                show_detail()
+
+        def show_detail(_: tk.Event | None = None) -> None:
+            selected = table.selection()
+            detail.configure(state="normal")
+            detail.delete("1.0", "end")
+            if not selected:
+                detail.configure(state="disabled")
+                return
+            attempt_id = int(selected[0])
+            row = self.attempt_store.get_attempt(attempt_id)
+            top_k = json.loads(row["top_k_predictions"] or "[]")
+            lines = [
+                f"Session: {row['session_id']}    Attempt: {attempt_id}",
+                f"Target: {row['target_label']}    Demo: "
+                f"{row['demo_video_id'] or 'not available'} "
+                f"{row['demo_video_version'] or ''}",
+                f"Model: {row['model_version']}    Preprocessing: "
+                f"{row['preprocessing_version']}",
+                f"Started: {row['started_at']}    Ended: {row['ended_at']}    "
+                f"Duration: {row['duration_seconds']}",
+                f"Raw prediction: {row['original_model_label'] or 'none'} "
+                f"(class {row['class_index']})",
+                f"Canonical prediction: {row['canonical_label'] or 'none'} "
+                f"({row['confidence']:.1%})",
+                f"Top-K: {json.dumps(top_k, ensure_ascii=False)}",
+                f"Ground truth: {row['ground_truth_label'] or 'unverified'}    "
+                f"Reviewer: {row['verified_by'] or '—'}    "
+                f"Verified: {row['verified_at'] or '—'}",
+                f"Status: {row['status']}    Error: {row['error'] or '—'}    "
+                f"Warning: {row['warning'] or '—'}",
+                "",
+                "EVENT TRACE",
+            ]
+            for event in self.attempt_store.attempt_events(attempt_id):
+                lines.append(
+                    f"{event['occurred_at']}  {event['event_type']}  "
+                    f"attempt={event['attempt_id'] or 'session'}  "
+                    f"{event['details_json']}"
+                )
+            lines.append("")
+            lines.append("VERIFICATION HISTORY")
+            for review in self.attempt_store.review_history(attempt_id):
+                lines.append(
+                    f"{review['reviewed_at']} {review['action']} by "
+                    f"{review['reviewer']}: {review['previous_ground_truth_label']} -> "
+                    f"{review['new_ground_truth_label']} "
+                    f"({review['previous_correctness_status']} -> "
+                    f"{review['new_correctness_status']}); {review['reason'] or 'no reason'}"
+                )
+            detail.insert("1.0", "\n".join(lines))
+            detail.configure(state="disabled")
+
+        def verify_selected() -> None:
+            selected = table.selection()
+            if not selected:
+                messagebox.showinfo(
+                    "Verify ground truth", "Select an attempt first.", parent=window
+                )
+                return
+            ground_truth = simpledialog.askstring(
+                "Verify ground truth",
+                "Enter the independently observed actual sign (not the requested target):",
+                parent=window,
+            )
+            if ground_truth is None:
+                return
+            reviewer = simpledialog.askstring(
+                "Reviewer",
+                "Reviewer identifier:",
+                parent=window,
+            )
+            if reviewer is None:
+                return
+            attempt_id = int(selected[0])
+            try:
+                status = self.attempt_store.verify_ground_truth(
+                    attempt_id, ground_truth, reviewer
+                )
+            except (KeyError, ValueError, sqlite3.Error) as exc:
+                messagebox.showerror("Verification failed", str(exc), parent=window)
+                return
+            messagebox.showinfo(
+                "Ground truth saved",
+                f"Attempt #{attempt_id}: {status} against verified ground truth.",
+                parent=window,
+            )
+            refresh(attempt_id)
+
+        table.bind("<<TreeviewSelect>>", show_detail)
+        ttk.Button(
+            controls,
+            text="Verify selected attempt",
+            command=verify_selected,
+        ).pack(side="left")
+        ttk.Button(controls, text="Refresh", command=refresh).pack(side="left", padx=8)
+        ttk.Button(controls, text="Close", command=window.destroy).pack(side="right")
+        refresh()
+
     def _open_missing_report(self) -> None:
         report_path = C.MISSING_SIGN_DEMOS_REPORT
-        if not report_path.is_file():
+        self._missing_report_error = self._update_missing_report()
+        if self._missing_report_error:
+            self.status_var.set(self._missing_report_error)
             messagebox.showerror(
                 "Missing-demo report",
-                f"Report not found: {report_path}",
+                self._missing_report_error,
                 parent=self.root,
             )
             return
-        os.startfile(str(report_path))
+        try:
+            os.startfile(str(report_path))
+        except OSError as exc:
+            self._missing_report_error = (
+                f"Could not open missing-demo report {report_path}: {exc}"
+            )
+            self.status_var.set(self._missing_report_error)
+            messagebox.showerror(
+                "Missing-demo report",
+                self._missing_report_error,
+                parent=self.root,
+            )
+
+    def _update_missing_report(self) -> str:
+        try:
+            write_missing_report(self.missing_demos)
+        except OSError as exc:
+            return f"Could not update missing-demo report: {exc}"
+        return ""
 
     def _open_demo_video(self, demo: SignDemo) -> None:
         self._video_capture = cv2.VideoCapture(str(demo.path))
@@ -1293,6 +1751,18 @@ class ASLApplication:
                 self._video_delay_ms / 1000 * 1.5,
             )
         self._video_last_tick = now
+        if not self._demo_watched and self.session_id is not None:
+            self.attempt_store.record_event(
+                self.session_id,
+                "demo_watched",
+                details={
+                    "target_label": self._selected_label,
+                    "demo_video_id": (
+                        self.catalog[self._selected_label].video_id
+                        if self._selected_label in self.catalog else None
+                    ),
+                },
+            )
         self._demo_watched = True
         self.reference_preview.show_frame(frame)
         self._schedule_video_frame()
@@ -1324,7 +1794,12 @@ class ASLApplication:
         self.root.bind("q", lambda _: self._request_close())
 
     def _show_mode(self, mode: str) -> None:
+        previous_mode = self._current_mode
+        if mode == "testing" or previous_mode == "testing":
+            self.subtitle_manager.clear()
         self._current_mode = mode
+        if mode == "testing":
+            self._ensure_testing_session()
         self._stop_demo_video()
         self.demo_page.grid_remove()
         self.testing_page.grid_remove()
@@ -1355,11 +1830,15 @@ class ASLApplication:
             "C=clear subtitle · L=toggle landmarks · Q=quit"
             if mode == "demo"
             else (
-                "Guided test · review the reference sign before starting an attempt."
-                if self.catalog
-                else "Guided testing is unavailable until at least one demo is verified."
+                "Guided test · reference demos are optional; reviewed ground truth is required for accuracy."
+                if self.vocab
+                else "Guided testing is unavailable because the checkpoint vocabulary is empty."
             )
         )
+        if mode == "testing" and self._missing_report_error:
+            self.status_var.set(
+                f"{self.status_var.get()} · {self._missing_report_error}"
+            )
         if mode == "demo" and self.worker is None and not self._closing:
             self._last_error = ""
             self.demo_preview.show_placeholder("Connecting to camera…")
@@ -1377,13 +1856,15 @@ class ASLApplication:
         if mode == self._current_mode or self._transitioning:
             return
         if self.worker is not None:
-            if self.worker.recording and not messagebox.askyesno(
+            if self.worker.current_attempt_id is not None and not messagebox.askyesno(
                 "Discard unfinished attempt?",
                 "Switching modes will discard this unfinished attempt. "
-                "No result will be saved. Continue?",
+                "It will be retained as cancelled. Continue?",
                 parent=self.root,
             ):
                 return
+            if self.worker.current_attempt_id is not None:
+                self._end_active_attempt("cancelled", "Mode changed before completion.")
             self._transitioning = True
             self._pending_mode = mode
             self.speech.cancel_pending()
@@ -1414,6 +1895,7 @@ class ASLApplication:
         camera_index: int,
         demo: SignDemo | None = None,
         target_label: str | None = None,
+        attempt_id: int | None = None,
     ) -> RecognitionWorker | None:
         if self.worker is not None:
             return None
@@ -1431,7 +1913,9 @@ class ASLApplication:
             demo_watched=self._demo_watched,
             demo_watch_duration=self._demo_watch_duration,
             model_version=self.model_version,
-            session_id=self.session_id,
+            session_id=self.session_id or "",
+            store=self.attempt_store,
+            attempt_id=attempt_id,
         )
         self.worker.start()
         if mode == "demo":
@@ -1450,8 +1934,8 @@ class ASLApplication:
         if self.worker is not None:
             self.status_var.set("Stop the current camera before starting another test.")
             return
-        if not self._selected_label or self._selected_label not in self.catalog:
-            self.status_var.set("A verified demonstration is required before testing.")
+        if not self._selected_label or self._selected_label not in self.vocab:
+            self.status_var.set("Select a target label before testing.")
             return
         self._stop_demo_video()
         try:
@@ -1462,17 +1946,27 @@ class ASLApplication:
         self.test_result.configure(
             text="Attempt in progress. Perform one sign, then choose Finish attempt."
         )
+        self.subtitle_manager.clear()
+        try:
+            attempt_id = self._create_test_attempt()
+        except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
+            messagebox.showerror("Testing attempt", str(exc), parent=self.root)
+            return
         worker = self._start_worker(
             mode="testing",
             camera_index=camera_index,
-            demo=self.catalog[self._selected_label],
+            demo=self.catalog.get(self._selected_label),
             target_label=self._selected_label,
+            attempt_id=attempt_id,
         )
         if worker is not None:
-            worker.command("start_attempt")
+            worker.command("start_attempt", attempt_id)
 
     def _toggle_test_recording(self) -> None:
-        if self.worker is None or self.worker.mode != "testing":
+        if self.worker is None:
+            self._start_test_attempt()
+            return
+        if self.worker.mode != "testing":
             return
         if self.worker.recording:
             self.worker.command("finish_attempt")
@@ -1481,21 +1975,45 @@ class ASLApplication:
             )
             self.test_camera_status.configure(text="Processing attempt…")
         else:
-            self.worker.command("start_attempt")
+            self.subtitle_manager.clear()
+            try:
+                attempt_id = self._create_test_attempt()
+            except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
+                messagebox.showerror("Testing attempt", str(exc), parent=self.root)
+                return
+            self.worker.command("start_attempt", attempt_id)
             self.test_attempt_button.configure(text="Starting…", state="disabled")
 
     def _stop_test_camera(self) -> None:
         if self.worker is None or self.worker.mode != "testing":
             return
-        if self.worker.recording and not messagebox.askyesno(
+        if self.worker.current_attempt_id is not None and not messagebox.askyesno(
             "Discard unfinished attempt?",
-            "Stopping now will discard this unfinished attempt. Continue?",
+            "Stopping now will retain this attempt as cancelled. Continue?",
             parent=self.root,
         ):
             return
+        if self.worker.current_attempt_id is not None:
+            self._end_active_attempt("cancelled", "Camera stopped before completion.")
         self.worker.stop()
         self.test_stop_button.configure(state="disabled")
         self.status_var.set("Stopping camera…")
+
+    def _end_active_attempt(self, status: str, reason: str) -> None:
+        if self.worker is None or self.worker.current_attempt_id is None:
+            return
+        attempt_id = self.worker.current_attempt_id
+        saved_status = self.attempt_store.finish_attempt(
+            attempt_id,
+            status=status,
+            error=reason,
+        )
+        self.worker.current_attempt_id = None
+        self.status_var.set(f"Attempt #{attempt_id} saved as {saved_status}.")
+        context = f": {reason}" if saved_status == status else ""
+        self.test_result.configure(
+            text=f"Attempt #{attempt_id} saved as {saved_status}{context}"
+        )
 
     def _clear_subtitle(self) -> None:
         self.speech.cancel_pending()
@@ -1565,7 +2083,7 @@ class ASLApplication:
                     )
                     self.test_stop_button.configure(state="disabled")
                     self.target_selector.configure(
-                        state="readonly" if self.catalog else "disabled"
+                        state="readonly" if self.vocab else "disabled"
                     )
                 if self._transitioning:
                     self._transitioning = False
@@ -1614,6 +2132,9 @@ class ASLApplication:
                 pass
             elif event == "committed":
                 sequence, label = value
+                if self.worker is None or self.worker.mode != "demo":
+                    self.events.task_done()
+                    continue
                 if (
                     self._transitioning
                     or self._ignore_commits_until_clear_ack
@@ -1633,7 +2154,9 @@ class ASLApplication:
                     text="Finish attempt", state="normal"
                 )
                 self.test_camera_status.configure(text="Recording")
-                self.status_var.set("Attempt started · finish when the sign is complete.")
+                self.status_var.set(
+                    f"Attempt #{value} started · finish when the sign is complete."
+                )
             elif event == "recording_progress":
                 self.test_camera_status.configure(text=f"Recording · {value} frames")
             elif event == "attempt_too_short":
@@ -1644,26 +2167,84 @@ class ASLApplication:
                 )
             elif event == "attempt_result":
                 result = value
-                predictions = result["predictions"]
-                best = predictions[0]
-                decision = (
-                    f"Not sure · best match: {best.canonical_label}"
-                    if best.confidence < self.args.thr
-                    else best.canonical_label
-                )
-                self.test_result.configure(
-                    text=(
-                        f"Prediction: {decision}\n"
-                        f"Confidence: {best.confidence:.0%}\n"
-                        f"Saved attempt #{result['attempt_id']} · "
-                        "ground truth is unverified"
+                if result["status"] == "completed":
+                    best = result["predictions"][0]
+                    self.test_result.configure(
+                        text=(
+                            f"Stable prediction: {best.canonical_label}\n"
+                            f"Confidence: {best.confidence:.0%}\n"
+                            f"Saved attempt #{result['attempt_id']} · "
+                            "ground truth is unverified"
+                        )
                     )
-                )
+                elif result["status"] == "no_prediction":
+                    self.test_result.configure(
+                        text=(
+                            f"No stable prediction was confirmed for attempt "
+                            f"#{result['attempt_id']}. It is saved separately and "
+                            "excluded from accuracy."
+                        )
+                    )
+                else:
+                    self.test_result.configure(
+                        text=(
+                            f"Attempt #{result['attempt_id']} is {result['status']} "
+                            f"({result['frames']} frames) and excluded from accuracy."
+                        )
+                    )
                 self.test_attempt_button.configure(
                     text="Start another attempt", state="normal"
                 )
                 self.test_camera_status.configure(text="Attempt saved")
-                self.status_var.set("Attempt saved · awaiting independent review.")
+                self.status_var.set(
+                    f"Attempt #{result['attempt_id']} saved as {result['status']}."
+                )
+            elif event == "stable_prediction":
+                result = value
+                prediction = result["prediction"]
+                self.test_result.configure(
+                    text=(
+                        f"Stable prediction: {prediction.canonical_label} "
+                        f"({prediction.confidence:.0%}) · attempt "
+                        f"#{result['attempt_id']}"
+                    )
+                )
+            elif event == "attempt_persisted":
+                if getattr(self.args, "debug_testing", False):
+                    self.debug_testing_label.configure(
+                        text=(
+                            f"Database save: attempt #{value['attempt_id']} "
+                            f"{value['status']}"
+                        )
+                    )
+                if value["status"] in {
+                    "cancelled",
+                    "interrupted",
+                    "error",
+                    "invalid",
+                }:
+                    self.test_result.configure(
+                        text=(
+                            f"Attempt #{value['attempt_id']} saved as "
+                            f"{value['status']} and excluded from accuracy."
+                        )
+                    )
+                    self.status_var.set(
+                        f"Attempt #{value['attempt_id']} saved as {value['status']}."
+                    )
+            elif event == "debug_state":
+                if getattr(self.args, "debug_testing", False):
+                    self.debug_testing_label.configure(
+                        text=(
+                            f"Session {value['session_id']} · attempt "
+                            f"{value['attempt_id'] or '—'} · target {value['target']} · "
+                            f"state {value['attempt_state']} · "
+                            f"candidate {value['candidate']} · stable {value['stable']} · "
+                            f"confidence {value['confidence']:.1%} · "
+                            f"stabilization {value['stabilization']} · "
+                            f"inference {value['latency_ms']:.1f} ms"
+                        )
+                    )
             elif event == "worker_error":
                 self._last_error = value
                 self.status_var.set(value)
@@ -1703,6 +2284,17 @@ class ASLApplication:
         self._closing = True
         self._stop_demo_video()
         self.speech.close()
+        if self.session_id is not None:
+            try:
+                session_status = "completed"
+                if self.worker is not None and self.worker.current_attempt_id is not None:
+                    self._end_active_attempt(
+                        "interrupted", "Application closed before attempt completion."
+                    )
+                    session_status = "interrupted"
+                self.attempt_store.end_session(self.session_id, session_status)
+            except (KeyError, ValueError, sqlite3.Error) as exc:
+                messagebox.showerror("Testing session", str(exc), parent=self.root)
         if self.worker is not None:
             self.worker.stop()
         else:
@@ -1725,6 +2317,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print rolling pipeline timing metrics every five seconds",
     )
+    parser.add_argument(
+        "--debug-testing",
+        action="store_true",
+        help="show Testing Mode attempt state and persistence diagnostics",
+    )
     parser.add_argument("--demo-manifest", default=str(C.SIGN_DEMO_MANIFEST))
     parser.add_argument("--attempt-db", default=str(C.RECOGNITION_ATTEMPTS_DB))
     return parser
@@ -1734,7 +2331,7 @@ def main() -> None:
     args = build_parser().parse_args()
     try:
         ASLApplication(args).root.mainloop()
-    except (FileNotFoundError, KeyError, RuntimeError) as exc:
+    except (FileNotFoundError, KeyError, RuntimeError, sqlite3.Error) as exc:
         messagebox.showerror("ASL Learning Studio", str(exc))
         raise SystemExit(1) from exc
 

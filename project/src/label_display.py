@@ -31,6 +31,12 @@ CANONICAL_LABELS = {
 
 def canonical_label(original_label: str) -> str:
     label = original_label.strip().upper()
+    variant_marker = " (VARIANT "
+    if label.endswith(")") and variant_marker in label:
+        base, variant = label.rsplit(variant_marker, 1)
+        variant_number = variant[:-1]
+        if base and variant_number.isdigit():
+            return f"{base} (variant {variant_number})"
     if label in CANONICAL_LABELS:
         return CANONICAL_LABELS[label]
     if label in DISTINCT_VARIANT_LABELS:

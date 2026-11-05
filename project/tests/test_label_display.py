@@ -14,6 +14,10 @@ class LabelDisplayTests(unittest.TestCase):
         self.assertEqual(canonical_label("WHATFOR2"), "WHAT FOR")
         self.assertEqual(canonical_label("CHRISTMAS1"), "CHRISTMAS (variant 1)")
         self.assertEqual(canonical_label("CHRISTMAS2"), "CHRISTMAS (variant 2)")
+        self.assertEqual(
+            canonical_label("CHRISTMAS (variant 1)"),
+            canonical_label("CHRISTMAS1"),
+        )
 
     def test_probability_aggregation_preserves_original_class_provenance(self):
         predictions = aggregate_predictions(
