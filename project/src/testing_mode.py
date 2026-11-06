@@ -19,6 +19,7 @@ from dataset import build_features, preprocess_sequence
 from extract import make_landmarker, result_to_array
 from label_display import aggregate_predictions, canonical_label
 from model import SeqClassifier
+from model_vocabulary import checkpoint_vocabulary
 from sign_demo_catalog import SignDemo, load_catalog, write_missing_report
 
 
@@ -239,7 +240,7 @@ def _run_camera_attempt(
 def run(args) -> None:
     checkpoint = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     checkpoint_args = checkpoint["args"]
-    vocab = checkpoint["vocab"]
+    vocab = checkpoint_vocabulary(checkpoint)
     model = SeqClassifier(
         checkpoint["feature_dim"],
         len(vocab),

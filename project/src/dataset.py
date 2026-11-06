@@ -7,13 +7,19 @@
   python src/dataset.py --min-hand-ratio 0.2
 """
 import argparse
-
+import csv
+import json
+import os
+import shutil
+import tempfile
+from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
 import config as C
+from model_vocabulary import build_class_mapping, validate_vocabulary
 
 
 # ---------- ฟังก์ชันพื้นฐาน ----------
@@ -139,35 +145,166 @@ def main():
     ap.add_argument("--min-hand-ratio", type=float, default=0.2, help="คัดวิดีโอที่ตรวจเจอมือน้อยกว่านี้ออก")
     args = ap.parse_args()
 
-    vocab = [l.strip() for l in (C.DATA / "vocab.txt").read_text(encoding="utf-8").splitlines() if l.strip()]
+    vocab = validate_vocabulary(
+        [
+            label.strip()
+            for label in (C.DATA / "vocab.txt").read_text(encoding="utf-8").splitlines()
+            if label.strip()
+        ]
+    )
     g2i = {g: i for i, g in enumerate(vocab)}
     C.FEATURES.mkdir(parents=True, exist_ok=True)
+    C.REPORTS.mkdir(parents=True, exist_ok=True)
+    report_rows = []
 
     for split in ["train", "val", "test"]:
         df = pd.read_csv(C.DATA / f"subset_{split}.csv")
+        unknown_labels = sorted(set(df["gloss"].astype(str)) - set(g2i))
+        if unknown_labels:
+            raise ValueError(
+                f"{split} subset contains labels missing from data/vocab.txt: "
+                + ", ".join(unknown_labels)
+            )
         P, PR, Y, PA, VI = [], [], [], [], []
-        skipped_missing = skipped_hands = 0
         for r in df.itertuples():
             f = C.LANDMARKS / (r.video.rsplit(".", 1)[0] + ".npy")
             if not f.exists():
-                skipped_missing += 1
+                report_rows.append(
+                    {
+                        "split": split,
+                        "video": r.video,
+                        "label": r.gloss,
+                        "status": "missing_landmarks",
+                        "frames": 0,
+                        "hand_ratio": "",
+                        "error": "Landmark file does not exist.",
+                    }
+                )
                 continue
-            raw = np.load(f)
-            hand = ~np.isnan(raw[:, C.LH, 0]).any(axis=1) | ~np.isnan(raw[:, C.RH, 0]).any(axis=1)
-            if hand.mean() < args.min_hand_ratio:
-                skipped_hands += 1
+            try:
+                raw = np.load(f)
+                if raw.ndim != 3 or raw.shape[1:] != (C.N_POINTS, 3):
+                    raise ValueError(
+                        f"Expected [frames, {C.N_POINTS}, 3], got {raw.shape}."
+                    )
+                if len(raw) == 0:
+                    raise ValueError("Landmark sequence is empty.")
+                hand = (
+                    ~np.isnan(raw[:, C.LH, 0]).any(axis=1)
+                    | ~np.isnan(raw[:, C.RH, 0]).any(axis=1)
+                )
+                hand_ratio = float(hand.mean())
+                if hand_ratio < args.min_hand_ratio:
+                    report_rows.append(
+                        {
+                            "split": split,
+                            "video": r.video,
+                            "label": r.gloss,
+                            "status": "low_hand_ratio",
+                            "frames": len(raw),
+                            "hand_ratio": hand_ratio,
+                            "error": (
+                                f"Hand ratio {hand_ratio:.4f} is below "
+                                f"{args.min_hand_ratio:.4f}."
+                            ),
+                        }
+                    )
+                    continue
+                pos, pres = preprocess_sequence(raw)
+            except (OSError, ValueError, EOFError, IndexError) as exc:
+                report_rows.append(
+                    {
+                        "split": split,
+                        "video": r.video,
+                        "label": r.gloss,
+                        "status": "invalid_landmarks",
+                        "frames": "",
+                        "hand_ratio": "",
+                        "error": str(exc),
+                    }
+                )
                 continue
-            pos, pres = preprocess_sequence(raw)
             P.append(pos)
             PR.append(pres)
             Y.append(g2i[r.gloss])
             PA.append(r.participant)
             VI.append(r.video)
-        np.savez_compressed(
-            C.FEATURES / f"{split}.npz",
-            pos=np.stack(P), present=np.stack(PR), y=np.array(Y), participant=np.array(PA), video=np.array(VI),
+            report_rows.append(
+                {
+                    "split": split,
+                    "video": r.video,
+                    "label": r.gloss,
+                    "status": "processed",
+                    "frames": len(raw),
+                    "hand_ratio": hand_ratio,
+                    "error": "",
+                }
+            )
+        feature_path = C.FEATURES / f"{split}.npz"
+        if feature_path.is_file():
+            backup_path = feature_path.with_name(
+                f"{feature_path.stem}."
+                f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+                f".bak{feature_path.suffix}"
+            )
+            shutil.copy2(feature_path, backup_path)
+            print(f"Existing {split} features backed up to {backup_path}")
+        positions = (
+            np.stack(P)
+            if P
+            else np.empty((0, C.SEQ_LEN, C.N_POINTS, 3), dtype=np.float32)
         )
-        print(f"{split}: kept {len(Y)}, no landmarks file {skipped_missing}, too few hands {skipped_hands}")
+        presence = (
+            np.stack(PR)
+            if PR
+            else np.empty((0, C.SEQ_LEN, 2), dtype=np.float32)
+        )
+        with tempfile.NamedTemporaryFile(
+            dir=feature_path.parent,
+            prefix=f".{split}.",
+            suffix=".npz",
+            delete=False,
+        ) as temporary:
+            temporary_path = temporary.name
+        try:
+            np.savez_compressed(
+                temporary_path,
+                pos=positions,
+                present=presence,
+                y=np.asarray(Y, dtype=np.int64),
+                participant=np.asarray(PA),
+                video=np.asarray(VI),
+                vocab=np.asarray(vocab),
+                class_mapping_json=np.asarray(
+                    json.dumps(build_class_mapping(vocab), ensure_ascii=False)
+                ),
+            )
+            os.replace(temporary_path, feature_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+        print(
+            f"{split}: kept {len(Y)} of {len(df)} source clips; "
+            f"{len(df) - len(Y)} excluded."
+        )
+
+    report_path = C.REPORTS / "preprocessing_report.csv"
+    with report_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=(
+                "split",
+                "video",
+                "label",
+                "status",
+                "frames",
+                "hand_ratio",
+                "error",
+            ),
+        )
+        writer.writeheader()
+        writer.writerows(report_rows)
+    print(f"Per-video preprocessing trace saved to {report_path}")
 
 
 if __name__ == "__main__":

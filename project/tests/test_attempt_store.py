@@ -217,6 +217,63 @@ class RecognitionAttemptStoreTests(unittest.TestCase):
         self.assertEqual(rows[0]["canonical_label"], "DOG1")
         self.assertEqual(rows[0]["session_id"], "legacy")
 
+    def test_evaluation_session_and_attempt_keep_full_provenance(self):
+        session_id = self.store.start_session(
+            "evaluation-session",
+            model_version="model-sha",
+            vocabulary_version="vocab-sha",
+            configuration={"confidence_threshold": 0.45},
+            signer_id="signer-01",
+            environment={"camera_index": 0, "lighting": "office"},
+            notes="first evaluation",
+            model_checkpoint="models/test.pt",
+            application_version="test-build",
+            model_id="test-model",
+        )
+        attempt_id = self.store.begin_attempt(
+            session_id=session_id,
+            target_label="AXE1",
+            model_version="model-sha",
+            preprocessing_version="pre-v1",
+        )
+
+        self.store.finish_attempt(
+            attempt_id,
+            status="completed",
+            predicted_label="DOG1",
+            original_model_label="DOG1",
+            canonical_label_value="DOG (variant 1)",
+            class_index=1,
+            confidence=0.8,
+            top_k_predictions=[
+                {
+                    "canonical_label": "DOG (variant 1)",
+                    "original_model_label": "DOG1",
+                    "class_index": 1,
+                    "confidence": 0.8,
+                }
+            ],
+            sequence_path="data/evaluation/sequences/1.npz",
+            sequence_length=64,
+            feature_dimension=590,
+            frame_count=128,
+        )
+        session = self.store.get_session(session_id)
+        attempt = self.store.get_attempt(attempt_id)
+
+        self.assertEqual(session["signer_id"], "signer-01")
+        self.assertEqual(session["environment_json"], '{"camera_index": 0, "lighting": "office"}')
+        self.assertEqual(session["notes"], "first evaluation")
+        self.assertEqual(attempt["target_label"], "AXE1")
+        self.assertIsNone(attempt["ground_truth_label"])
+        self.assertEqual(attempt["correctness_status"], "unverified")
+        self.assertEqual(attempt["model_id"], "test-model")
+        self.assertEqual(attempt["vocabulary_version"], "vocab-sha")
+        self.assertEqual(attempt["sequence_path"], "data/evaluation/sequences/1.npz")
+        self.assertEqual(attempt["sequence_length"], 64)
+        self.assertEqual(attempt["feature_dimension"], 590)
+        self.assertEqual(attempt["frame_count"], 128)
+
     def test_session_lifecycle_attempt_trace_and_no_prediction_status(self):
         session_id = self.store.start_session(
             "session-1",

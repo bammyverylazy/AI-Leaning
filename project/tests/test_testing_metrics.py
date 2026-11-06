@@ -151,6 +151,57 @@ class TestingMetricsTests(unittest.TestCase):
         self.assertIsNone(report["verified_top1"]["accuracy"])
         self.assertIn("0 / 0", format_report(report))
 
+    def test_confidence_buckets_use_only_verified_attempts_and_report_coverage(self):
+        attempts = [
+            {
+                "status": "completed",
+                "correctness_status": "correct",
+                "target_label": "A",
+                "predicted_label": "A",
+                "canonical_label": "A",
+                "ground_truth_label": "A",
+                "confidence": 0.9,
+                "top_k_predictions": "[]",
+            },
+            {
+                "status": "completed",
+                "correctness_status": "incorrect",
+                "target_label": "A",
+                "predicted_label": "B",
+                "canonical_label": "B",
+                "ground_truth_label": "A",
+                "confidence": 0.6,
+                "top_k_predictions": "[]",
+            },
+            {
+                "status": "completed",
+                "correctness_status": "unverified",
+                "target_label": "A",
+                "predicted_label": "A",
+                "canonical_label": "A",
+                "confidence": 0.1,
+                "top_k_predictions": "[]",
+            },
+            {
+                "status": "no_prediction",
+                "correctness_status": "unverified",
+                "target_label": "A",
+                "predicted_label": "",
+                "canonical_label": "",
+            },
+        ]
+
+        report = build_report(attempts)
+
+        self.assertEqual(report["confidence_analysis"]["high (>=75%)"]["total"], 1)
+        self.assertEqual(report["confidence_analysis"]["medium (50-<75%)"]["total"], 1)
+        self.assertEqual(report["confidence_analysis"]["low (<50%)"]["total"], 0)
+        self.assertEqual(report["coverage"]["eligible_attempts"], 4)
+        self.assertEqual(report["coverage"]["answered"], 3)
+        self.assertEqual(report["coverage"]["rejected"], 1)
+        self.assertEqual(report["coverage"]["coverage"], 0.75)
+        self.assertEqual(report["coverage"]["answered_verified_total"], 2)
+
     def test_persist_verify_and_report_pipeline_keeps_target_separate(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = RecognitionAttemptStore(Path(temp_dir) / "attempts.sqlite3")

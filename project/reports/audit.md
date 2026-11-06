@@ -1,3 +1,5 @@
+> **Historical report — superseded by [`model_reality_audit.md`](./model_reality_audit.md), 2026-11-05.** This report describes an older 50-sign vocabulary and is not an evaluation of the active `gru_seed3.pt` checkpoint. Use the current report and refreshed `dataset_report.json` instead.
+
 # Project audit
 
 ## 1. Dataset size and samples per class

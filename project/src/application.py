@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 import statistics
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,10 +27,13 @@ from tkinter import messagebox, simpledialog, ttk
 import config as C
 from attempt_store import RecognitionAttemptStore
 from dataset import build_features, preprocess_sequence
+from evaluation_sequences import load_attempt_sequence, save_attempt_sequence
 from extract import make_landmarker, result_to_array
 from label_display import CanonicalPrediction, aggregate_predictions, canonical_label
 from model import SeqClassifier
+from model_vocabulary import checkpoint_vocabulary
 from sign_demo_catalog import SignDemo, load_catalog, write_missing_report
+from self_recorded_store import SelfRecordedSampleStore, validate_recording_arrays
 from speech import SpeechService, spoken_text
 from subtitle import State, SubtitleManager
 from testing_metrics import build_report, format_report
@@ -230,6 +234,19 @@ class CameraCapture(threading.Thread):
         self.performance = performance
         self.mode = mode
         self.dropped_frames = 0
+        self._camera_lock = threading.Lock()
+        self._camera: cv2.VideoCapture | None = None
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self._release_camera()
+
+    def _release_camera(self) -> None:
+        with self._camera_lock:
+            camera = self._camera
+            self._camera = None
+        if camera is not None:
+            camera.release()
 
     def run(self) -> None:
         camera: cv2.VideoCapture | None = None
@@ -239,9 +256,15 @@ class CameraCapture(threading.Thread):
                 camera.release()
                 camera = cv2.VideoCapture(self.camera_index)
             if not camera.isOpened():
+                camera.release()
                 raise RuntimeError(
                     f"Could not open camera {self.camera_index}; try another camera index."
                 )
+            with self._camera_lock:
+                self._camera = camera
+            if self.stop_event.is_set():
+                self._release_camera()
+                return
             camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             camera.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 1000)
@@ -272,8 +295,7 @@ class CameraCapture(threading.Thread):
                 self.events.put(("worker_error", str(exc)))
                 self.stop_event.set()
         finally:
-            if camera is not None:
-                camera.release()
+            self._release_camera()
 
 
 class VideoPanel(ttk.Frame):
@@ -330,6 +352,8 @@ class RecognitionWorker(threading.Thread):
         session_id: str,
         store: RecognitionAttemptStore | None = None,
         attempt_id: int | None = None,
+        collection_video_path: Path | None = None,
+        collection_sample_id: str = "",
     ) -> None:
         super().__init__(name="asl-recognition", daemon=True)
         self.mode = mode
@@ -347,6 +371,10 @@ class RecognitionWorker(threading.Thread):
         self.session_id = session_id
         self.store = store
         self.current_attempt_id = attempt_id
+        self.collection_video_path = collection_video_path
+        self.collection_sample_id = collection_sample_id
+        self._collection_video_writer: cv2.VideoWriter | None = None
+        self._collection_started_at: float | None = None
         self._stop_event = threading.Event()
         self._commands: queue.Queue[tuple[str, int | None]] = queue.Queue()
         self._frame_lock = threading.Lock()
@@ -367,7 +395,9 @@ class RecognitionWorker(threading.Thread):
         self._candidate_label = ""
         self._candidate_started_at: float | None = None
         self._stable_predictions: list[CanonicalPrediction] = []
+        self._stable_sequence_snapshot: dict[str, np.ndarray] | None = None
         self._attempt_inference_latencies: list[float] = []
+        self._attempt_frame_count = 0
         self._prediction_interval = 2
         self._frames: queue.Queue[tuple[np.ndarray, float]] = queue.Queue(
             maxsize=1
@@ -396,7 +426,7 @@ class RecognitionWorker(threading.Thread):
 
     def stop(self) -> None:
         self._stop_event.set()
-        self.capture.stop_event.set()
+        self.capture.stop()
 
     @property
     def commit_info(self) -> tuple[int, str, float, float] | None:
@@ -456,7 +486,7 @@ class RecognitionWorker(threading.Thread):
                         max(0.0, (frame_started - captured_at) * 1000),
                     )
 
-                    if self.mode == "demo" or (
+                    if self.mode in {"demo", "collection"} or (
                         self.mode == "testing" and self.recording
                     ):
                         stage_started = time.perf_counter()
@@ -484,12 +514,16 @@ class RecognitionWorker(threading.Thread):
                             (time.perf_counter() - landmark_started) * 1000,
                         )
                         frame_buffer.append(landmarks)
-                        if self.mode == "testing":
+                        if self.mode in {"testing", "collection"} and self.recording:
                             recording_frames.append(landmarks)
-                            self.events.put(
-                                ("recording_progress", len(recording_frames))
-                            )
-                        if frame_count % self._prediction_interval == 0:
+                            self._attempt_frame_count += 1
+                            if self.mode == "testing":
+                                self.events.put(
+                                    ("recording_progress", len(recording_frames))
+                                )
+                            elif self.collection_video_path is not None:
+                                self._write_collection_video_frame(raw_frame)
+                        if self.mode != "collection" and frame_count % self._prediction_interval == 0:
                             self._recognize_live(frame_buffer, landmarks)
                         if self.mode == "demo":
                             display_landmarks = landmarks.copy()
@@ -530,6 +564,13 @@ class RecognitionWorker(threading.Thread):
                     )
             self.events.put(("worker_error", str(exc)))
         finally:
+            self._release_collection_video()
+            if (
+                self.mode == "collection"
+                and self.recording
+                and self.collection_video_path is not None
+            ):
+                self.collection_video_path.unlink(missing_ok=True)
             if self.mode == "testing" and self.current_attempt_id is not None:
                 try:
                     self._finish_active_attempt(
@@ -572,6 +613,41 @@ class RecognitionWorker(threading.Thread):
                 self._latest_commit = None
                 self.events.put(("subtitle_cleared", self.commit_sequence))
                 self.events.put(("subtitle", ""))
+            elif command == "start_collection" and self.mode == "collection":
+                if self.recording:
+                    self.events.put(
+                        ("collection_error", "A recording is already in progress.")
+                    )
+                    continue
+                frames.clear()
+                frame_buffer.clear()
+                self._attempt_frame_count = 0
+                self._collection_started_at = time.perf_counter()
+                self._collection_video_writer = None
+                with self._recording_lock:
+                    self._recording = True
+                self.events.put(("collection_started", None))
+            elif command == "finish_collection" and self.mode == "collection":
+                with self._recording_lock:
+                    was_recording = self._recording
+                    self._recording = False
+                if was_recording:
+                    self._finish_collection(frames)
+            elif command == "cancel_collection" and self.mode == "collection":
+                with self._recording_lock:
+                    was_recording = self._recording
+                    self._recording = False
+                if was_recording:
+                    frames.clear()
+                    frame_buffer.clear()
+                    self._attempt_frame_count = 0
+                    self._collection_started_at = None
+                    self._release_collection_video()
+                    if self.collection_video_path is not None:
+                        self.collection_video_path.unlink(missing_ok=True)
+                    self.collection_video_path = None
+                    self.collection_sample_id = ""
+                    self.events.put(("collection_cancelled", None))
             elif command == "start_attempt" and self.mode == "testing":
                 if attempt_id is None and self.current_attempt_id is None:
                     self.events.put(("worker_error", "No initialized attempt is attached."))
@@ -585,7 +661,9 @@ class RecognitionWorker(threading.Thread):
                 self._candidate_label = ""
                 self._candidate_started_at = None
                 self._stable_predictions = []
+                self._stable_sequence_snapshot = None
                 self._attempt_inference_latencies = []
+                self._attempt_frame_count = 0
                 with self._recording_lock:
                     self._recording = True
                 self.events.put(("attempt_started", self.current_attempt_id))
@@ -596,21 +674,88 @@ class RecognitionWorker(threading.Thread):
                 if was_recording:
                     self._finish_attempt(frames)
 
+    def _write_collection_video_frame(self, frame: np.ndarray) -> None:
+        if self.collection_video_path is None:
+            return
+        if self._collection_video_writer is None:
+            self.collection_video_path.parent.mkdir(parents=True, exist_ok=True)
+            height, width = frame.shape[:2]
+            writer = cv2.VideoWriter(
+                str(self.collection_video_path),
+                cv2.VideoWriter.fourcc(*"MJPG"),
+                20.0,
+                (width, height),
+            )
+            if not writer.isOpened():
+                writer.release()
+                raise RuntimeError(
+                    "Could not open the optional raw-video recording. Disable "
+                    "raw video or check the OpenCV video codec installation."
+                )
+            self._collection_video_writer = writer
+        self._collection_video_writer.write(frame)
+
+    def _release_collection_video(self) -> None:
+        writer = self._collection_video_writer
+        self._collection_video_writer = None
+        if writer is not None:
+            writer.release()
+
+    def _finish_collection(self, frames: list[np.ndarray]) -> None:
+        self._release_collection_video()
+        started_at = self._collection_started_at
+        self._collection_started_at = None
+        if started_at is None:
+            self.events.put(
+                ("collection_error", "Recording start time was not available.")
+            )
+            return
+        video_path = ""
+        if self.collection_video_path is not None and self.collection_video_path.is_file():
+            video_path = str(self.collection_video_path.resolve())
+        self.events.put(
+            (
+                "collection_ready",
+                {
+                    "raw_landmarks": (
+                        np.stack(frames).astype(np.float32, copy=False)
+                        if frames else np.empty((0, C.N_POINTS, 3), dtype=np.float32)
+                    ),
+                    "duration_seconds": max(0.0, time.perf_counter() - started_at),
+                    "original_frame_count": len(frames),
+                    "raw_video_path": video_path,
+                    "sample_id": (
+                        self.collection_sample_id
+                    ),
+                },
+            )
+        )
+
     def _recognize_live(
         self,
         frame_buffer: collections.deque[np.ndarray],
         landmarks: np.ndarray,
     ) -> None:
-        hands_present = not (
-            np.isnan(landmarks[C.LH, 0]).all()
-            and np.isnan(landmarks[C.RH, 0]).all()
+        hands_present = (
+            not np.isnan(landmarks[C.LH, 0]).any()
+            or not np.isnan(landmarks[C.RH, 0]).any()
         )
         self._hands_present = hands_present
         predictions: list[CanonicalPrediction] = []
+        sequence_snapshot: dict[str, np.ndarray] | None = None
         if len(frame_buffer) == C.SEQ_LEN:
             preprocess_started = time.perf_counter()
-            positions, present = preprocess_sequence(np.stack(frame_buffer))
-            features = torch.from_numpy(build_features(positions, present))[None]
+            landmark_window = np.stack(frame_buffer)
+            positions, present = preprocess_sequence(landmark_window)
+            feature_array = build_features(positions, present)
+            features = torch.from_numpy(feature_array)[None]
+            if self.mode == "testing" and self.recording:
+                sequence_snapshot = {
+                    "raw_landmarks": landmark_window.copy(),
+                    "normalized_positions": positions.copy(),
+                    "hand_present": present.copy(),
+                    "model_features": feature_array.copy(),
+                }
             self.performance.add(
                 "sequence_preprocessing",
                 (time.perf_counter() - preprocess_started) * 1000,
@@ -659,6 +804,11 @@ class RecognitionWorker(threading.Thread):
                 )
                 if self.mode == "testing" and self.current_attempt_id is not None:
                     self._stable_predictions = predictions
+                    if sequence_snapshot is None:
+                        raise RuntimeError(
+                            "Stable prediction has no corresponding model input sequence"
+                        )
+                    self._stable_sequence_snapshot = sequence_snapshot
                     if self.store is None:
                         raise RuntimeError("Testing attempt storage is unavailable")
                     self.store.record_event(
@@ -875,6 +1025,7 @@ class RecognitionWorker(threading.Thread):
             self._finish_active_attempt(
                 "invalid",
                 error=f"Attempt contained only {len(frames)} usable frames.",
+                frame_count=len(frames),
             )
             self.events.put(
                 (
@@ -892,6 +1043,7 @@ class RecognitionWorker(threading.Thread):
             self._finish_active_attempt(
                 "no_prediction",
                 warning="No prediction reached the configured stabilization threshold.",
+                frame_count=len(frames),
             )
             self.events.put(
                 (
@@ -907,6 +1059,85 @@ class RecognitionWorker(threading.Thread):
             return
         predictions = self._stable_predictions
         best = predictions[0]
+        sequence_snapshot = self._stable_sequence_snapshot
+        if sequence_snapshot is None:
+            self._finish_active_attempt(
+                "error",
+                error="Stable prediction was recorded without a replayable sequence.",
+                frame_count=len(frames),
+            )
+            self.events.put(
+                (
+                    "attempt_result",
+                    {
+                        "attempt_id": attempt_id,
+                        "status": "error",
+                        "frames": len(frames),
+                        "target_label": self.target_label,
+                    },
+                )
+            )
+            return
+        try:
+            sequence_path = save_attempt_sequence(
+                attempt_id,
+                raw_landmarks=sequence_snapshot["raw_landmarks"],
+                normalized_positions=sequence_snapshot["normalized_positions"],
+                hand_present=sequence_snapshot["hand_present"],
+                model_features=sequence_snapshot["model_features"],
+                metadata={
+                    "attempt_id": attempt_id,
+                    "session_id": self.session_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "target_label": self.target_label,
+                    "model_checkpoint": (
+                        str(Path(self.args.ckpt).resolve())
+                        if getattr(self.args, "ckpt", "")
+                        else ""
+                    ),
+                    "model_version": self.model_version,
+                    "preprocessing_version": C.PREPROCESSING_VERSION,
+                    "sequence_length": C.SEQ_LEN,
+                    "feature_dimension": int(
+                        sequence_snapshot["model_features"].shape[1]
+                    ),
+                    "frame_count": len(frames),
+                },
+            )
+        except (OSError, ValueError) as exc:
+            self._finish_active_attempt(
+                "error",
+                error=f"Could not save replay sequence: {exc}",
+                frame_count=len(frames),
+            )
+            self.events.put(
+                (
+                    "attempt_result",
+                    {
+                        "attempt_id": attempt_id,
+                        "status": "error",
+                        "frames": len(frames),
+                        "target_label": self.target_label,
+                        "error": str(exc),
+                    },
+                )
+            )
+            return
+        if self.store is None:
+            raise RuntimeError("Testing attempt storage is unavailable")
+        self.store.record_event(
+            self.session_id,
+            "sequence_saved",
+            attempt_id=attempt_id,
+            details={
+                "sequence_path": sequence_path,
+                "frame_count": len(frames),
+                "sequence_length": C.SEQ_LEN,
+                "feature_dimension": int(
+                    sequence_snapshot["model_features"].shape[1]
+                ),
+            },
+        )
         self._finish_active_attempt(
             "completed",
             predicted_label=best.canonical_label,
@@ -928,6 +1159,10 @@ class RecognitionWorker(threading.Thread):
                 statistics.fmean(self._attempt_inference_latencies)
                 if self._attempt_inference_latencies else None
             ),
+            sequence_path=sequence_path,
+            sequence_length=C.SEQ_LEN,
+            feature_dimension=int(sequence_snapshot["model_features"].shape[1]),
+            frame_count=len(frames),
         )
         self.events.put(
             (
@@ -938,6 +1173,7 @@ class RecognitionWorker(threading.Thread):
                     "predictions": predictions,
                     "frames": len(frames),
                     "target_label": self.target_label,
+                    "sequence_path": sequence_path,
                 },
             )
         )
@@ -955,12 +1191,18 @@ class RecognitionWorker(threading.Thread):
         top_k_predictions: list[dict] | None = None,
         confidence: float = 0.0,
         inference_latency_ms: float | None = None,
+        sequence_path: str = "",
+        sequence_length: int | None = None,
+        feature_dimension: int | None = None,
+        frame_count: int | None = None,
     ) -> None:
         attempt_id = self.current_attempt_id
         if attempt_id is None:
             return
         if self.store is None:
             raise RuntimeError("Testing attempt storage is unavailable")
+        if frame_count is None:
+            frame_count = self._attempt_frame_count
         saved_status = self.store.finish_attempt(
             attempt_id,
             status=status,
@@ -971,6 +1213,10 @@ class RecognitionWorker(threading.Thread):
             top_k_predictions=top_k_predictions,
             confidence=confidence,
             inference_latency_ms=inference_latency_ms,
+            sequence_path=sequence_path,
+            sequence_length=sequence_length,
+            feature_dimension=feature_dimension,
+            frame_count=frame_count,
             error=error,
             warning=warning,
         )
@@ -996,6 +1242,9 @@ class ASLApplication:
         ).hexdigest()
         self.session_id: str | None = None
         self.attempt_store = RecognitionAttemptStore(Path(args.attempt_db))
+        self.recording_store = SelfRecordedSampleStore(
+            Path(getattr(args, "recording_db", C.SELF_RECORDING_DB))
+        )
         manifest_path = Path(args.demo_manifest)
         self.catalog, self.missing_demos = load_catalog(self.vocab, manifest_path)
         self._missing_report_error = self._update_missing_report()
@@ -1015,12 +1264,31 @@ class ASLApplication:
         self._ignore_commits_until_clear_ack = False
         self._sound_enabled = tk.BooleanVar(value=True)
         self._current_mode = "demo"
+        self._collection_pending_id: str | None = None
+        self._collection_sample_id = ""
+        self._collection_last_accepted_id = ""
+        self._collection_review_frame: np.ndarray | None = None
+        self._collection_review_landmarks: np.ndarray | None = None
+        self._collection_review_frame_index = 0
+        self._collection_review_after_id: str | None = None
+        self._collection_metadata: dict[str, Any] = {}
+        self._collection_session_id: str | None = None
+        self._collection_session_signer_id: str | None = None
+        self._collection_preview_result: dict[str, Any] | None = None
+        self._collection_countdown_after: str | None = None
+        self._collection_countdown_remaining = 0
+        self._collection_camera_state = "off"
+        self._collection_recording_state = "idle"
         self._last_error = ""
         self._initial_target_error = ""
         self._video_capture: cv2.VideoCapture | None = None
         self._video_after_id: str | None = None
         self._video_playing = False
         self._video_last_tick = 0.0
+        self._active_video_panel: VideoPanel | None = None
+        self._active_video_status: ttk.Label | None = None
+        self._active_video_button: ttk.Button | None = None
+        self._video_is_collection = False
         self._demo_watched = False
         self._demo_watch_duration = 0.0
         self._selected_label = ""
@@ -1067,10 +1335,11 @@ class ASLApplication:
         checkpoint = torch.load(
             checkpoint_path, map_location="cpu", weights_only=False
         )
+        vocab = checkpoint_vocabulary(checkpoint)
         checkpoint_args = checkpoint["args"]
         model = SeqClassifier(
             checkpoint["feature_dim"],
-            len(checkpoint["vocab"]),
+            len(vocab),
             checkpoint_args["hidden"],
             2,
             checkpoint_args["dropout"],
@@ -1078,7 +1347,7 @@ class ASLApplication:
         )
         model.load_state_dict(checkpoint["model"])
         model.eval()
-        return model, list(checkpoint["vocab"])
+        return model, vocab
 
     def _configure_style(self) -> None:
         style = ttk.Style(self.root)
@@ -1144,6 +1413,7 @@ class ASLApplication:
         self.page_container.rowconfigure(0, weight=1)
         self.demo_page = self._build_demo_page(self.page_container)
         self.testing_page = self._build_testing_page(self.page_container)
+        self.collection_page = self._build_collection_page(self.page_container)
         self.status_var = tk.StringVar(value="Ready")
         self.status_label = ttk.Label(
             self.root,
@@ -1194,6 +1464,13 @@ class ASLApplication:
         page.rowconfigure(0, weight=1)
         self.demo_preview = VideoPanel(page, height=720)
         self.demo_preview.grid(row=0, column=0, sticky="nsew")
+        self.demo_retry_button = ttk.Button(
+            page,
+            text="Retry camera",
+            style="Accent.TButton",
+            command=self._toggle_demo_camera,
+        )
+        self.demo_retry_button.place_forget()
         return page
 
     def _build_testing_page(self, parent: tk.Misc) -> ttk.Frame:
@@ -1221,6 +1498,13 @@ class ASLApplication:
             command=self._show_testing_report,
         )
         report_button.grid(row=0, column=3, padx=(8, 0))
+        studio_button = ttk.Button(
+            heading,
+            text="Self-recording Studio",
+            style="Secondary.TButton",
+            command=lambda: self._request_mode("collection"),
+        )
+        studio_button.grid(row=0, column=4, padx=(8, 0))
         self.demo_count_label = ttk.Label(
             heading,
             text=f"{len(self.catalog)} of {len(self.vocab)} verified demos",
@@ -1340,6 +1624,1251 @@ class ASLApplication:
         self._populate_targets()
         return page
 
+    def _build_collection_page(self, parent: tk.Misc) -> ttk.Frame:
+        page = ttk.Frame(parent, style="App.TFrame", padding=(18, 12))
+        page.columnconfigure(0, weight=3)
+        page.columnconfigure(1, weight=2)
+        page.rowconfigure(1, weight=1)
+        heading = ttk.Frame(page, style="App.TFrame")
+        heading.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        heading.columnconfigure(0, weight=1)
+        ttk.Label(
+            heading, text="Self-recording Studio", style="Title.TLabel"
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            heading,
+            text="Guided Testing",
+            style="Secondary.TButton",
+            command=lambda: self._request_mode("testing"),
+        ).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(
+            heading,
+            text="Refresh collection",
+            style="Secondary.TButton",
+            command=self._refresh_collection_dashboard,
+        ).grid(row=0, column=2, padx=(8, 0))
+
+        controls_pane = ttk.Frame(page, style="App.TFrame")
+        controls_pane.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
+        controls_pane.columnconfigure(0, weight=1)
+        controls_pane.rowconfigure(0, weight=1)
+        self.collection_controls_canvas = tk.Canvas(
+            controls_pane,
+            bg=BACKGROUND,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.collection_controls_canvas.grid(row=0, column=0, sticky="nsew")
+        controls_scrollbar = ttk.Scrollbar(
+            controls_pane,
+            orient="vertical",
+            command=self.collection_controls_canvas.yview,
+        )
+        controls_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.collection_controls_canvas.configure(
+            yscrollcommand=controls_scrollbar.set
+        )
+        controls = self._card(self.collection_controls_canvas)
+        self.collection_controls_window = self.collection_controls_canvas.create_window(
+            (0, 0), window=controls, anchor="nw"
+        )
+        controls.bind(
+            "<Configure>",
+            lambda _event: self.collection_controls_canvas.configure(
+                scrollregion=self.collection_controls_canvas.bbox("all")
+            ),
+        )
+        self.collection_controls_canvas.bind(
+            "<Configure>",
+            lambda event: self.collection_controls_canvas.itemconfigure(
+                self.collection_controls_window, width=event.width
+            ),
+        )
+        controls.columnconfigure(1, weight=1)
+        ttk.Label(
+            controls, text="Step A — Recording information", style="Subheading.TLabel"
+        ).grid(
+            row=0, column=0, columnspan=2, sticky="w"
+        )
+        self.collection_target_var = tk.StringVar()
+        self.collection_target_selector = ttk.Combobox(
+            controls,
+            textvariable=self.collection_target_var,
+            values=self.vocab,
+            state="readonly",
+        )
+        self.collection_target_selector.grid(
+            row=1, column=1, sticky="ew", padx=(12, 0), pady=(8, 0)
+        )
+        ttk.Label(controls, text="Target sign", style="Muted.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(8, 0)
+        )
+        self.collection_target_selector.bind(
+            "<<ComboboxSelected>>", self._update_collection_reference
+        )
+        if self.vocab:
+            self.collection_target_var.set(self.vocab[0])
+
+        self.collection_reference_status = ttk.Label(
+            controls,
+            text="Choose a target to check for a verified demonstration.",
+            style="Muted.TLabel",
+        )
+        self.collection_reference_status.grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(5, 3)
+        )
+        session_actions = ttk.Frame(controls, style="Card.TFrame")
+        session_actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(5, 4))
+        session_actions.columnconfigure(0, weight=1)
+        self.collection_session_var = tk.StringVar(
+            value="No recording session started."
+        )
+        ttk.Label(
+            session_actions,
+            textvariable=self.collection_session_var,
+            style="Muted.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self.collection_session_button = ttk.Button(
+            session_actions,
+            text="Start recording session",
+            style="Secondary.TButton",
+            command=self._start_collection_session,
+        )
+        self.collection_session_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        ttk.Label(
+            controls, text="Optional reference demonstration", style="Muted.TLabel"
+        ).grid(row=13, column=0, columnspan=2, sticky="w", pady=(10, 2))
+        reference_actions = ttk.Frame(controls, style="Card.TFrame")
+        reference_actions.grid(row=14, column=0, columnspan=2, sticky="ew")
+        self.collection_reference_button = ttk.Button(
+            reference_actions,
+            text="Play verified reference",
+            style="Secondary.TButton",
+            command=self._toggle_collection_reference,
+            state="disabled",
+        )
+        self.collection_reference_button.pack(side="left")
+
+        self.collection_reference_preview = VideoPanel(controls, height=170)
+        self.collection_reference_preview.grid(
+            row=15, column=0, columnspan=2, sticky="ew", pady=(6, 8)
+        )
+
+        ttk.Label(
+            controls, text="Camera conditions", style="Muted.TLabel"
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 2))
+        metadata = ttk.Frame(controls, style="Card.TFrame")
+        metadata.grid(row=5, column=0, columnspan=2, sticky="ew")
+        metadata.columnconfigure(1, weight=1)
+        metadata.columnconfigure(3, weight=1)
+        self.collection_metadata_widgets: list[tk.Widget] = []
+        self.collection_signer_var = tk.StringVar()
+        self.collection_dominant_hand_var = tk.StringVar(value="UNKNOWN")
+        self.collection_angle_var = tk.StringVar(value="unknown")
+        self.collection_distance_var = tk.StringVar(value="unknown")
+        self.collection_lighting_var = tk.StringVar(value="unknown")
+        self.collection_speed_var = tk.StringVar(value="unknown")
+        self.collection_notes_var = tk.StringVar()
+        for index, (label, variable, values) in enumerate(
+            (
+                (
+                    "Anonymous signer ID (e.g. S001)",
+                    self.collection_signer_var,
+                    tuple(self.recording_store.signer_ids()),
+                ),
+                (
+                    "Camera angle",
+                    self.collection_angle_var,
+                    ("front", "slightly left", "slightly right", "unknown"),
+                ),
+                ("Distance", self.collection_distance_var, ("near", "normal", "far", "unknown")),
+                ("Lighting", self.collection_lighting_var, ("bright", "normal", "dim", "unknown")),
+                ("Signing speed", self.collection_speed_var, ("slow", "normal", "fast", "unknown")),
+                (
+                    "Dominant hand",
+                    self.collection_dominant_hand_var,
+                    ("RIGHT", "LEFT", "UNKNOWN"),
+                ),
+                ("Notes (optional)", self.collection_notes_var, None),
+            )
+        ):
+            row, pair = divmod(index, 2)
+            label_column = pair * 2
+            ttk.Label(metadata, text=label, style="Muted.TLabel").grid(
+                row=row,
+                column=label_column,
+                sticky="w",
+                padx=(0, 6),
+                pady=2,
+            )
+            if values is None:
+                widget: tk.Widget = ttk.Entry(metadata, textvariable=variable)
+            elif label.startswith("Anonymous signer ID"):
+                widget = ttk.Combobox(
+                    metadata,
+                    textvariable=variable,
+                    values=values,
+                    state="normal",
+                    width=20,
+                )
+                self.collection_signer_selector = widget
+            else:
+                widget = ttk.Combobox(
+                    metadata,
+                    textvariable=variable,
+                    values=values,
+                    state="readonly",
+                    width=20,
+                )
+            widget.grid(
+                row=row,
+                column=label_column + 1,
+                sticky="ew",
+                padx=(0, 12 if pair == 0 else 0),
+                pady=2,
+            )
+            self.collection_metadata_widgets.append(widget)
+
+        ttk.Label(
+            controls, text="Step B — Camera preview", style="Subheading.TLabel"
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 4))
+        self.collection_camera_status_var = tk.StringVar(value="Camera is off")
+        ttk.Label(
+            controls,
+            textvariable=self.collection_camera_status_var,
+            style="Muted.TLabel",
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self.collection_preview = VideoPanel(controls, height=160)
+        self.collection_preview.grid(
+            row=8, column=0, columnspan=2, sticky="ew", pady=(0, 6)
+        )
+        ttk.Label(
+            controls, text="Step C — Recording controls", style="Subheading.TLabel"
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(5, 4))
+        actions = ttk.Frame(controls, style="Card.TFrame")
+        actions.grid(row=10, column=0, columnspan=2, sticky="ew")
+        for column in range(4):
+            actions.columnconfigure(column, weight=1)
+        self.collection_camera_button = ttk.Button(
+            actions,
+            text="Start camera",
+            style="Secondary.TButton",
+            command=self._toggle_collection_camera,
+        )
+        self.collection_camera_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.collection_record_button = ttk.Button(
+            actions,
+            text="Record sample",
+            style="Accent.TButton",
+            command=self._start_collection_countdown,
+            state="disabled",
+        )
+        self.collection_record_button.grid(row=0, column=1, sticky="ew", padx=3)
+        self.collection_finish_button = ttk.Button(
+            actions,
+            text="Finish recording",
+            style="Accent.TButton",
+            command=self._finish_collection_recording,
+            state="disabled",
+        )
+        self.collection_finish_button.grid(row=0, column=2, sticky="ew", padx=3)
+        self.collection_cancel_button = ttk.Button(
+            actions,
+            text="Cancel recording",
+            style="Secondary.TButton",
+            command=self._cancel_collection_recording,
+            state="disabled",
+        )
+        self.collection_cancel_button.grid(row=0, column=3, sticky="ew", padx=(3, 0))
+        self.collection_video_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            actions,
+            text="Keep raw video (larger file; contains identifiable image)",
+            variable=self.collection_video_var,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self.collection_status_var = tk.StringVar(
+            value="Select a sign and start the camera to collect a sample."
+        )
+        ttk.Label(
+            controls,
+            textvariable=self.collection_status_var,
+            style="Muted.TLabel",
+            wraplength=680,
+            justify="left",
+        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.collection_review_actions = ttk.Frame(controls, style="Card.TFrame")
+        self.collection_review_actions.grid(
+            row=12, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+        )
+        self.collection_save_button = ttk.Button(
+            self.collection_review_actions,
+            text="Save pending-review candidate",
+            command=self._save_collection_candidate,
+            state="disabled",
+        )
+        self.collection_save_button.pack(side="left")
+        self.collection_discard_preview_button = ttk.Button(
+            self.collection_review_actions,
+            text="Discard preview",
+            command=self._discard_collection_preview,
+            state="disabled",
+        )
+        self.collection_discard_preview_button.pack(side="left", padx=(8, 0))
+        self.collection_accept_button = ttk.Button(
+            self.collection_review_actions,
+            text="Accept sample",
+            command=lambda: self._review_collection_sample("accepted"),
+            state="disabled",
+        )
+        self.collection_accept_button.pack(side="left")
+        self.collection_reject_button = ttk.Button(
+            self.collection_review_actions,
+            text="Reject sample",
+            command=lambda: self._review_collection_sample("rejected"),
+            state="disabled",
+        )
+        self.collection_reject_button.pack(side="left", padx=(8, 0))
+        self.collection_verify_button = ttk.Button(
+            self.collection_review_actions,
+            text="Set independently reviewed ground truth",
+            command=self._verify_collection_sample,
+            state="disabled",
+        )
+        self.collection_verify_button.pack(side="left", padx=(8, 0))
+
+        overview = self._card(page)
+        overview.grid(row=1, column=1, sticky="nsew")
+        overview.columnconfigure(0, weight=1)
+        overview.rowconfigure(2, weight=1)
+        self.collection_overview_var = tk.StringVar(value="")
+        ttk.Label(
+            overview,
+            textvariable=self.collection_overview_var,
+            style="Subheading.TLabel",
+            wraplength=400,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            overview,
+            text="Signs are ordered from least collected; underrepresented means fewer than 5 accepted samples.",
+            style="Muted.TLabel",
+            wraplength=400,
+        ).grid(row=1, column=0, sticky="w", pady=(5, 8))
+        self.collection_dashboard = ttk.Treeview(
+            overview,
+            columns=("sign", "samples", "signers"),
+            show="headings",
+            height=16,
+        )
+        for column, title, width in (
+            ("sign", "Sign", 190),
+            ("samples", "Accepted", 80),
+            ("signers", "Signers", 70),
+        ):
+            self.collection_dashboard.heading(column, text=title)
+            self.collection_dashboard.column(column, width=width, stretch=False)
+        self.collection_dashboard.grid(row=2, column=0, sticky="nsew")
+        self.collection_dashboard.bind(
+            "<Double-1>", self._select_collection_dashboard_sign
+        )
+        self.collection_sample_detail = tk.Text(
+            overview,
+            height=8,
+            wrap="word",
+            bg=CARD,
+            fg=INK,
+            insertbackground=INK,
+            font=("Consolas", 9),
+            padx=8,
+            pady=6,
+        )
+        self.collection_sample_detail.grid(
+            row=3, column=0, sticky="ew", pady=(8, 0)
+        )
+        self.collection_sample_detail.configure(state="disabled")
+        ttk.Label(
+            overview,
+            text="Review queue · select a recording to inspect its sequence",
+            style="Muted.TLabel",
+        ).grid(row=4, column=0, sticky="w", pady=(8, 3))
+        self.collection_review_queue = ttk.Treeview(
+            overview,
+            columns=("target", "status", "signer", "recorded"),
+            show="headings",
+            height=6,
+        )
+        for column, title, width in (
+            ("target", "Target", 90),
+            ("status", "Status", 135),
+            ("signer", "Signer", 95),
+            ("recorded", "Recorded", 140),
+        ):
+            self.collection_review_queue.heading(column, text=title)
+            self.collection_review_queue.column(
+                column, width=width, stretch=column == "recorded"
+            )
+        self.collection_review_queue.grid(row=5, column=0, sticky="nsew")
+        self.collection_review_queue.bind(
+            "<<TreeviewSelect>>", self._select_collection_review_sample
+        )
+        overview.rowconfigure(5, weight=1)
+        self._bind_collection_scroll()
+        self._update_collection_buttons()
+        return page
+
+    def _refresh_collection_dashboard(self) -> None:
+        try:
+            dashboard = self.recording_store.dashboard(self.vocab)
+            samples = self.recording_store.samples()
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            self.collection_status_var.set(
+                f"Could not load collection overview: {exc}"
+            )
+            return
+        underrepresented = sum(
+            row["samples"] < 5 for row in dashboard["by_sign"]
+        )
+        self.collection_overview_var.set(
+            f"Accepted {dashboard['accepted']} · rejected {dashboard['rejected']} · "
+            f"{dashboard['signers']} signers · "
+            f"{dashboard['classes_covered']}/{len(self.vocab)} classes covered · "
+            f"{underrepresented} missing/underrepresented"
+        )
+        for item in self.collection_dashboard.get_children():
+            self.collection_dashboard.delete(item)
+        for row in dashboard["by_sign"]:
+            self.collection_dashboard.insert(
+                "",
+                "end",
+                iid=row["label"],
+                values=(row["label"], row["samples"], row["signers"]),
+            )
+        for item in self.collection_review_queue.get_children():
+            self.collection_review_queue.delete(item)
+        for row in samples[-100:]:
+            self.collection_review_queue.insert(
+                "",
+                "end",
+                iid=row["sample_id"],
+                values=(
+                    row["target_label"],
+                    row["recording_status"] or row["status"],
+                    row["signer_id"] or "unknown",
+                    row["recorded_at"][:19].replace("T", " "),
+                ),
+            )
+        sample_lines = [
+            f"{row['sample_id']} · {row['target_label']} · {row['status']} · "
+            f"{row['signer_id'] or 'signer unknown'} · "
+            f"{row['session_id'] or 'session unknown'} · "
+            f"split={row['dataset_split']} · "
+            f"ground truth={row['ground_truth_label'] or 'unreviewed'}"
+            for row in samples[-8:]
+        ]
+        detail = "Recent samples (latest 8):\n" + (
+            "\n".join(sample_lines) if sample_lines else "No recordings yet."
+        )
+        self.collection_sample_detail.configure(state="normal")
+        self.collection_sample_detail.delete("1.0", "end")
+        self.collection_sample_detail.insert("1.0", detail)
+        self.collection_sample_detail.configure(state="disabled")
+
+    def _select_collection_review_sample(
+        self, _: tk.Event | None = None
+    ) -> None:
+        selected = self.collection_review_queue.selection()
+        if not selected:
+            return
+        if self._collection_preview_result is not None:
+            self.collection_status_var.set(
+                "Save or discard the current preview before inspecting another sample."
+            )
+            return
+        if self._collection_camera_state != "off":
+            self.collection_status_var.set(
+                "Stop the recording camera before inspecting a saved sample."
+            )
+            return
+        sample_id = selected[0]
+        try:
+            sample = self.recording_store.get(sample_id)
+        except (OSError, sqlite3.Error, KeyError, ValueError) as exc:
+            self.collection_status_var.set(
+                f"Could not inspect sample {sample_id}: {exc}"
+            )
+            return
+
+        self._stop_collection_sequence_replay()
+        self._collection_review_frame = None
+        self._collection_review_landmarks = None
+        if sample["status"] == "pending_review":
+            self._collection_pending_id = sample_id
+            self._collection_last_accepted_id = ""
+            self._collection_recording_state = "review"
+        elif (
+            sample["status"] == "accepted"
+            and sample["verification_status"] != "VERIFIED"
+        ):
+            self._collection_pending_id = None
+            self._collection_last_accepted_id = sample_id
+            self._collection_recording_state = "idle"
+        else:
+            self._collection_pending_id = None
+            self._collection_last_accepted_id = ""
+            self._collection_recording_state = "idle"
+
+        try:
+            sequence = load_attempt_sequence(
+                self.recording_store.resolve_artifact_path(sample["sequence_path"])
+            )
+            raw = sequence["raw_landmarks"]
+            hand_count, hand_ratio, warnings = validate_recording_arrays(
+                raw,
+                sequence["normalized_positions"],
+                sequence["hand_present"],
+                sequence["model_features"],
+            )
+            if len(raw) == 0:
+                raise ValueError("The saved sequence contains no frames.")
+            self._collection_review_landmarks = raw
+            self._collection_review_frame_index = 0
+            technical_quality = (
+                f"technical checks passed · hands in {hand_ratio:.0%} "
+                f"({hand_count} frames)"
+            )
+            if warnings:
+                technical_quality += " · " + " ".join(warnings)
+        except (OSError, KeyError, ValueError, IndexError) as exc:
+            technical_quality = f"technical sequence check failed: {exc}"
+
+        if self._collection_review_landmarks is not None:
+            self._advance_collection_sequence_replay()
+        else:
+            self._collection_review_frame = None
+        if self._collection_review_frame is not None:
+            self.collection_preview.show_frame(self._collection_review_frame)
+        else:
+            self.collection_preview.show_placeholder(
+                "Sequence unavailable or invalid; it may still be rejected."
+            )
+        self.collection_camera_status_var.set(
+            f"Reviewing saved sample · {sample['recording_status'] or sample['status']}"
+        )
+        self.collection_status_var.set(
+            f"Sample {sample_id} · target is a prompt, not ground truth · "
+            f"{technical_quality}"
+        )
+        self.collection_sample_detail.configure(state="normal")
+        self.collection_sample_detail.delete("1.0", "end")
+        self.collection_sample_detail.insert(
+            "1.0",
+            "\n".join(
+                (
+                    f"Sample: {sample_id}",
+                    f"Target (not verified ground truth): {sample['target_label']}",
+                    f"Ground truth: {sample['ground_truth_label'] or 'not verified'}",
+                    f"Signer: {sample['signer_id'] or 'unknown'}",
+                    f"Session: {sample['session_id'] or 'unknown'}",
+                    f"Recorded: {sample['recorded_at']}",
+                    (
+                        f"Camera: {sample['camera_source'] or 'unknown'} · "
+                        f"angle={sample['camera_angle']} · "
+                        f"distance={sample['distance']} · "
+                        f"lighting={sample['lighting']} · "
+                        f"speed={sample['signing_speed']}"
+                    ),
+                    f"Dominant hand: {sample['dominant_hand'] or 'unknown'}",
+                    f"Status: {sample['recording_status'] or sample['status']} · "
+                    f"{sample['verification_status'] or 'verification unknown'}",
+                    f"Quality: {sample['quality_status'] or 'unknown'} · {technical_quality}",
+                    f"Rejection reason: {sample['rejection_reason'] or 'none'}",
+                    f"Sequence: {sample['sequence_path']}",
+                )
+            ),
+        )
+        self.collection_sample_detail.configure(state="disabled")
+        self._update_collection_buttons()
+
+    def _bind_collection_scroll(self) -> None:
+        def bind_children(widget: tk.Misc) -> None:
+            widget.bind("<MouseWheel>", self._scroll_collection_panel, add="+")
+            for child in widget.winfo_children():
+                bind_children(child)
+
+        bind_children(self.collection_controls_canvas)
+
+    def _scroll_collection_panel(self, event: tk.Event) -> str:
+        self.collection_controls_canvas.yview_scroll(
+            -1 * int(event.delta / 120), "units"
+        )
+        return "break"
+
+    def _update_collection_buttons(self) -> None:
+        camera_state = self._collection_camera_state
+        recording_state = self._collection_recording_state
+        session_locked = (
+            self._collection_pending_id is not None
+            or self._collection_preview_result is not None
+            or recording_state
+            in {"countdown", "starting", "recording", "saving", "cancelling"}
+        )
+        self.collection_session_button.configure(
+            text=(
+                "Start new session"
+                if self._collection_session_id is not None
+                else "Start recording session"
+            ),
+            state="disabled" if session_locked else "normal",
+        )
+        self.collection_camera_button.configure(
+            text={
+                "off": "Start camera",
+                "starting": "Starting camera…",
+                "ready": "Stop camera",
+                "stopping": "Stopping camera…",
+                "error": "Retry camera",
+            }.get(camera_state, "Start camera"),
+            state="normal" if camera_state in {"off", "ready", "error"} else "disabled",
+        )
+        self.collection_record_button.configure(
+            text=(
+                f"Get ready… {self._collection_countdown_remaining}"
+                if recording_state == "countdown"
+                else "Record sample"
+            ),
+            state=(
+                "normal"
+                if camera_state == "ready"
+                and recording_state == "idle"
+                and self._collection_pending_id is None
+                and self._collection_preview_result is None
+                and self._collection_session_id is not None
+                else "disabled"
+            ),
+        )
+        self.collection_finish_button.configure(
+            state="normal" if recording_state == "recording" else "disabled"
+        )
+        self.collection_cancel_button.configure(
+            state=(
+                "normal"
+                if recording_state in {"countdown", "recording"}
+                else "disabled"
+            )
+        )
+        self.collection_save_button.configure(
+            state="normal" if recording_state == "preview" else "disabled"
+        )
+        self.collection_discard_preview_button.configure(
+            state="normal" if recording_state == "preview" else "disabled"
+        )
+        self.collection_accept_button.configure(
+            state="normal" if recording_state == "review" else "disabled"
+        )
+        self.collection_reject_button.configure(
+            state="normal" if recording_state == "review" else "disabled"
+        )
+        verify_ready = (
+            bool(getattr(self, "_collection_last_accepted_id", ""))
+            and recording_state in {"idle", "review"}
+            and self._collection_pending_id is None
+            and self._collection_preview_result is None
+        )
+        self.collection_verify_button.configure(
+            state="normal" if verify_ready else "disabled"
+        )
+
+    def _select_collection_dashboard_sign(self, _: tk.Event | None = None) -> None:
+        selected = self.collection_dashboard.selection()
+        if selected:
+            self.collection_target_var.set(selected[0])
+            self._update_collection_reference()
+
+    def _update_collection_reference(self, _: tk.Event | None = None) -> None:
+        label = self.collection_target_var.get()
+        demo = self.catalog.get(label)
+        if demo is None:
+            self.collection_reference_status.configure(
+                text=(
+                    f"Target: {label or 'none selected'} · no verified reference; "
+                    "recording is still allowed."
+                )
+            )
+            self.collection_reference_button.configure(state="disabled")
+            self.collection_reference_preview.show_placeholder(
+                "No verified reference demonstration available."
+            )
+            return
+        self.collection_reference_status.configure(
+            text=f"Target: {label} · verified reference · version {demo.version}"
+        )
+        self.collection_reference_button.configure(
+            state="normal", text="Play verified reference"
+        )
+        self.collection_reference_preview.show_placeholder(
+            "Press Play verified reference to review this sign."
+        )
+
+    def _toggle_collection_reference(self) -> None:
+        if self._video_playing:
+            self._stop_demo_video()
+            self.collection_reference_button.configure(
+                text="Play verified reference"
+            )
+            return
+        demo = self.catalog.get(self.collection_target_var.get())
+        if demo is None:
+            return
+        self._open_demo_video(
+            demo,
+            panel=self.collection_reference_preview,
+            status=self.collection_reference_status,
+            button=self.collection_reference_button,
+        )
+
+    def _toggle_collection_camera(self) -> None:
+        self._stop_collection_sequence_replay()
+        if self.worker is not None:
+            if self.worker.mode != "collection":
+                self.collection_status_var.set(
+                    "Stop the active camera before opening the recording studio."
+                )
+                return
+            if self.worker.recording and not messagebox.askyesno(
+                "Discard current recording?",
+                "Stopping the camera now discards the unfinished recording. Continue?",
+                parent=self.root,
+            ):
+                return
+            if self._collection_countdown_after is not None:
+                self.root.after_cancel(self._collection_countdown_after)
+                self._collection_countdown_after = None
+                self._collection_countdown_remaining = 0
+                self._set_collection_metadata_enabled(True)
+            self.worker.stop()
+            self._collection_camera_state = "stopping"
+            self._collection_recording_state = "idle"
+            self._update_collection_buttons()
+            self.collection_camera_status_var.set("Stopping camera…")
+            return
+        try:
+            camera_index = int(self.camera_index.get())
+        except (ValueError, tk.TclError):
+            messagebox.showerror("Camera", "Enter a valid camera index.", parent=self.root)
+            return
+        self.collection_preview.show_placeholder("Connecting to camera…")
+        self._collection_camera_state = "starting"
+        self._collection_recording_state = "idle"
+        self._update_collection_buttons()
+        self.collection_camera_status_var.set("Connecting to camera…")
+        self._start_worker(mode="collection", camera_index=camera_index)
+
+    def _start_collection_session(self) -> None:
+        if self._collection_pending_id is not None or self._collection_preview_result:
+            self.collection_status_var.set(
+                "Save or discard the current preview, then finish its review before "
+                "starting another session."
+            )
+            return
+        try:
+            signer_id = self.recording_store.validate_signer_id(
+                self.collection_signer_var.get()
+            )
+        except ValueError as exc:
+            self.collection_status_var.set(str(exc))
+            return
+        try:
+            signer_ids = set(self.recording_store.signer_ids()) | {signer_id}
+        except (OSError, sqlite3.Error) as exc:
+            self.collection_status_var.set(
+                f"Could not load signer IDs: {exc}"
+            )
+            return
+        self._collection_session_id = self.recording_store.new_session_id()
+        self._collection_session_signer_id = signer_id
+        self.collection_signer_selector.configure(
+            values=tuple(sorted(signer_ids))
+        )
+        self.collection_signer_var.set(signer_id)
+        self.collection_session_var.set(
+            f"Session: {self._collection_session_id} · signer {signer_id}"
+        )
+        self.collection_status_var.set(
+            "Session started. Record multiple clips with this signer; choose "
+            "Start new session to change the session or signer."
+        )
+        self._update_collection_buttons()
+
+    def _stop_collection_sequence_replay(self) -> None:
+        after_id = getattr(self, "_collection_review_after_id", None)
+        if after_id is not None:
+            self.root.after_cancel(after_id)
+            self._collection_review_after_id = None
+
+    def _advance_collection_sequence_replay(self) -> None:
+        landmarks = self._collection_review_landmarks
+        if landmarks is None or len(landmarks) == 0:
+            return
+        image = np.zeros((480, 640, 3), dtype=np.uint8)
+        draw_landmark_overlay(
+            image, landmarks[self._collection_review_frame_index]
+        )
+        self._collection_review_frame = image
+        self.collection_preview.show_frame(image)
+        self._collection_review_frame_index = (
+            self._collection_review_frame_index + 1
+        ) % len(landmarks)
+        self._collection_review_after_id = self.root.after(
+            100, self._advance_collection_sequence_replay
+        )
+
+    def _start_collection_countdown(self) -> None:
+        if self._collection_pending_id is not None:
+            self.collection_status_var.set(
+                "Accept or reject the current sample before recording another."
+            )
+            return
+        if self._collection_preview_result is not None:
+            self.collection_status_var.set(
+                "Save or discard the captured preview before recording again."
+            )
+            return
+        if self.worker is None or self.worker.mode != "collection":
+            self.collection_status_var.set("Start the collection camera first.")
+            return
+        target = self.collection_target_var.get()
+        if target not in self.vocab:
+            self.collection_status_var.set(
+                "Select a target sign from the vocabulary."
+            )
+            return
+        if self._collection_session_id is None:
+            self.collection_status_var.set(
+                "Start a recording session before recording a sample."
+            )
+            return
+        try:
+            signer_id = self.recording_store.validate_signer_id(
+                self.collection_signer_var.get()
+            )
+        except ValueError as exc:
+            self.collection_status_var.set(str(exc))
+            return
+        if signer_id != self._collection_session_signer_id:
+            self.collection_status_var.set(
+                "The signer changed. Start a new session before recording."
+            )
+            return
+        if not self.worker.is_alive():
+            self.collection_status_var.set(
+                "Camera worker is not running. Stop and start the camera to retry."
+            )
+            return
+        self._collection_metadata = {
+            "target_label": target,
+            "signer_id": signer_id,
+            "session_id": self._collection_session_id,
+            "dominant_hand": self.collection_dominant_hand_var.get(),
+            "camera_index": int(self.camera_index.get()),
+            "camera_source": f"opencv-index:{int(self.camera_index.get())}",
+            "camera_angle": self.collection_angle_var.get(),
+            "distance": self.collection_distance_var.get(),
+            "lighting": self.collection_lighting_var.get(),
+            "signing_speed": self.collection_speed_var.get(),
+            "notes": self.collection_notes_var.get().strip(),
+            "raw_video": bool(self.collection_video_var.get()),
+        }
+        self.collection_target_selector.configure(state="disabled")
+        for widget in self.collection_metadata_widgets:
+            widget.configure(
+                {"state": "disabled"}
+            )
+        self._collection_recording_state = "countdown"
+        self._collection_countdown_remaining = 3
+        self._update_collection_buttons()
+        self._tick_collection_countdown()
+
+    def _tick_collection_countdown(self) -> None:
+        if (
+            self.worker is None
+            or self.worker.mode != "collection"
+            or self._collection_camera_state != "ready"
+            or not self.worker.is_alive()
+            or self._collection_camera_state != "ready"
+        ):
+            self._collection_countdown_after = None
+            self._collection_recording_state = "idle"
+            self._set_collection_metadata_enabled(True)
+            self._update_collection_buttons()
+            self.collection_status_var.set(
+                "Camera stopped before recording could begin."
+            )
+            return
+        if self._collection_countdown_remaining <= 0:
+            self._collection_countdown_after = None
+            sample_id = SelfRecordedSampleStore.new_sample_id()
+            self._collection_metadata["recorded_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            self._collection_sample_id = sample_id
+            self.worker.collection_sample_id = sample_id
+            self.worker.collection_video_path = (
+                C.SELF_RECORDING / "raw" / f"{sample_id}.avi"
+                if self._collection_metadata["raw_video"]
+                else None
+            )
+            self.worker.command("start_collection")
+            self._collection_recording_state = "starting"
+            self.collection_status_var.set(
+                f"Recording {self._collection_metadata['target_label']}… "
+                "perform one complete sign, then finish the recording."
+            )
+            self._update_collection_buttons()
+            return
+        self._update_collection_buttons()
+        self.collection_status_var.set(
+            f"Get ready… {self._collection_countdown_remaining}"
+        )
+        self._collection_countdown_remaining -= 1
+        self._collection_countdown_after = self.root.after(
+            1000, self._tick_collection_countdown
+        )
+
+    def _finish_collection_recording(self) -> None:
+        if self.worker is None or self.worker.mode != "collection":
+            return
+        if self.worker.recording:
+            self.worker.command("finish_collection")
+            self._collection_recording_state = "saving"
+            self._update_collection_buttons()
+            self.collection_status_var.set(
+                "Processing landmarks and checking recording quality…"
+            )
+
+    def _cancel_collection_recording(self) -> None:
+        if self._collection_countdown_after is not None:
+            self.root.after_cancel(self._collection_countdown_after)
+            self._collection_countdown_after = None
+            self._collection_countdown_remaining = 0
+            self._collection_recording_state = "idle"
+            self._set_collection_metadata_enabled(True)
+            self._update_collection_buttons()
+            self.collection_status_var.set("Countdown cancelled. No sample was saved.")
+            return
+        if (
+            self.worker is not None
+            and self.worker.mode == "collection"
+            and self.worker.recording
+        ):
+            self.worker.command("cancel_collection")
+            self._collection_recording_state = "cancelling"
+            self._update_collection_buttons()
+            self.collection_status_var.set(
+                "Cancelling recording; captured frames will be discarded."
+            )
+
+    def _set_collection_metadata_enabled(self, enabled: bool) -> None:
+        self.collection_target_selector.configure(
+            state="readonly" if enabled else "disabled"
+        )
+        for widget in self.collection_metadata_widgets:
+            if isinstance(widget, ttk.Combobox):
+                is_signer_selector = widget is self.collection_signer_selector
+                widget.configure(
+                    {
+                        "state": (
+                            "normal"
+                            if enabled and is_signer_selector
+                            else "readonly"
+                            if enabled
+                            else "disabled"
+                        )
+                    }
+                )
+            else:
+                widget.configure(
+                    {"state": "normal" if enabled else "disabled"}
+                )
+
+    def _on_collection_ready(self, result: dict[str, Any]) -> None:
+        raw_landmarks = result["raw_landmarks"]
+        sample_id = self._collection_sample_id or result["sample_id"]
+        try:
+            if len(raw_landmarks) == 0:
+                raise ValueError("No valid camera frames were detected; record again.")
+            positions, present = preprocess_sequence(raw_landmarks)
+            features = build_features(positions, present)
+            hand_count, hand_ratio, warnings = validate_recording_arrays(
+                raw_landmarks, positions, present, features
+            )
+        except (ValueError, IndexError) as exc:
+            video_path = result.get("raw_video_path")
+            if video_path:
+                try:
+                    Path(video_path).unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    exc = RuntimeError(
+                        f"{exc}; could not remove temporary video: {cleanup_error}"
+                    )
+            self.collection_status_var.set(
+                f"Recording preview is invalid and was not saved: {exc} Record again."
+            )
+            self._collection_recording_state = "idle"
+            self._update_collection_buttons()
+            self._set_collection_metadata_enabled(True)
+            self._collection_sample_id = ""
+            return
+        preview_index = len(raw_landmarks) // 2
+        preview = np.zeros((480, 640, 3), dtype=np.uint8)
+        draw_landmark_overlay(preview, raw_landmarks[preview_index])
+        self._collection_review_frame = preview
+        self._collection_preview_result = {
+            **result,
+            "sample_id": sample_id,
+            "raw_landmarks": raw_landmarks,
+            "normalized_positions": positions,
+            "hand_present": present,
+            "model_features": features,
+            "hand_frame_count": hand_count,
+            "hand_frame_ratio": hand_ratio,
+            "quality_warnings": warnings,
+        }
+        self._collection_recording_state = "preview"
+        message = (
+            f"Preview ready · {result['original_frame_count']} frames · "
+            f"{result['duration_seconds']:.1f}s · hand landmarks in "
+            f"{hand_ratio:.0%} of frames · features "
+            f"{C.SEQ_LEN}×{features.shape[1]}."
+        )
+        if warnings:
+            message += " Quality warning: " + " ".join(warnings)
+        message += " Review this preview, then save it as pending review or discard it."
+        self.collection_status_var.set(message)
+        self.collection_camera_status_var.set("Camera ready · unsaved preview")
+        self._update_collection_buttons()
+        self._set_collection_metadata_enabled(True)
+        details = [
+            f"Unsaved preview: {sample_id}",
+            f"Target (not verified ground truth): {self._collection_metadata['target_label']}",
+            f"Signer ID: {self._collection_metadata['signer_id']}",
+            f"Session ID: {self._collection_metadata['session_id']}",
+            f"Dominant hand: {self._collection_metadata['dominant_hand']}",
+            (
+                f"Camera={self._collection_metadata['camera_source']} · "
+                f"angle={self._collection_metadata['camera_angle']} · "
+                f"distance={self._collection_metadata['distance']} · "
+                f"lighting={self._collection_metadata['lighting']} · "
+                f"speed={self._collection_metadata['signing_speed']}"
+            ),
+            f"Notes: {self._collection_metadata['notes'] or 'none'}",
+            "Not saved yet. Target is not verified ground truth.",
+        ]
+        self.collection_sample_detail.configure(state="normal")
+        self.collection_sample_detail.delete("1.0", "end")
+        self.collection_sample_detail.insert("1.0", "\n".join(details))
+        self.collection_sample_detail.configure(state="disabled")
+
+    def _save_collection_candidate(self) -> None:
+        result = self._collection_preview_result
+        if result is None:
+            return
+        metadata = self._collection_metadata
+        try:
+            saved = self.recording_store.create_pending(
+                sample_id=result["sample_id"],
+                target_label=metadata["target_label"],
+                signer_id=metadata["signer_id"],
+                session_id=metadata["session_id"],
+                dominant_hand=metadata["dominant_hand"],
+                camera_source=metadata["camera_source"],
+                camera_index=metadata["camera_index"],
+                camera_angle=metadata["camera_angle"],
+                distance=metadata["distance"],
+                lighting=metadata["lighting"],
+                signing_speed=metadata["signing_speed"],
+                notes=metadata["notes"],
+                duration_seconds=result["duration_seconds"],
+                original_frame_count=result["original_frame_count"],
+                raw_landmarks=result["raw_landmarks"],
+                normalized_positions=result["normalized_positions"],
+                hand_present=result["hand_present"],
+                model_features=result["model_features"],
+                model_version=self.model_version,
+                raw_video_path=result["raw_video_path"],
+                recorded_at=metadata["recorded_at"],
+            )
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            self.collection_status_var.set(
+                f"Candidate was not saved: {exc} You can retry or discard the preview."
+            )
+            return
+        sample_id = result["sample_id"]
+        self._collection_preview_result = None
+        self._collection_pending_id = sample_id
+        self._collection_recording_state = "review"
+        self.collection_status_var.set(
+            "Saved as PENDING_REVIEW · ACCEPTED_UNVERIFIED will require a separate "
+            "review, and verified ground truth is still unset."
+        )
+        self.collection_camera_status_var.set("Camera ready · pending review")
+        self.collection_accept_button.configure(state="normal")
+        self.collection_reject_button.configure(state="normal")
+        self.collection_verify_button.configure(state="disabled")
+        self._update_collection_buttons()
+        self._refresh_collection_dashboard()
+        self.collection_sample_detail.configure(state="normal")
+        self.collection_sample_detail.delete("1.0", "end")
+        self.collection_sample_detail.insert(
+            "1.0",
+            "\n".join(
+                (
+                    f"Sample: {sample_id}",
+                    f"Target (not verified ground truth): {metadata['target_label']}",
+                    f"Signer ID: {metadata['signer_id']}",
+                    f"Session ID: {metadata['session_id']}",
+                    f"Status: PENDING_REVIEW · UNVERIFIED",
+                    f"Sequence: {saved['sequence_path']}",
+                )
+            ),
+        )
+        self.collection_sample_detail.configure(state="disabled")
+
+    def _discard_collection_preview(self) -> None:
+        result = self._collection_preview_result
+        if result is None:
+            return
+        self._stop_collection_sequence_replay()
+        self._collection_review_landmarks = None
+        video_path = result.get("raw_video_path")
+        try:
+            if video_path:
+                Path(video_path).unlink(missing_ok=True)
+        except OSError as exc:
+            self.collection_status_var.set(
+                f"Preview was not saved, but its temporary video could not be removed: {exc}"
+            )
+            return
+        self._collection_preview_result = None
+        self._collection_review_frame = None
+        self._collection_sample_id = ""
+        self._collection_recording_state = "idle"
+        self.collection_camera_status_var.set("Camera ready")
+        self.collection_status_var.set(
+            "Preview discarded. No candidate or sample record was created."
+        )
+        self.collection_preview.show_placeholder("Camera is ready")
+        self._update_collection_buttons()
+        self._set_collection_metadata_enabled(True)
+
+    def _review_collection_sample(self, decision: str) -> None:
+        sample_id = self._collection_pending_id
+        if sample_id is None:
+            return
+        rejection_reason = ""
+        if decision == "rejected":
+            rejection_reason = simpledialog.askstring(
+                "Reason for rejection",
+                "Briefly explain why this recording should be rejected:",
+                parent=self.root,
+            ) or ""
+            if not rejection_reason.strip():
+                self.collection_status_var.set(
+                    "Enter a rejection reason; the sample remains pending review."
+                )
+                return
+        try:
+            self.recording_store.review(
+                sample_id,
+                decision,
+                "Reviewed in Self-recording Studio.",
+                rejection_reason,
+            )
+        except (OSError, sqlite3.Error, KeyError, ValueError) as exc:
+            messagebox.showerror("Sample review failed", str(exc), parent=self.root)
+            return
+        self._collection_pending_id = None
+        self._collection_sample_id = ""
+        self._stop_collection_sequence_replay()
+        self._collection_review_landmarks = None
+        self._collection_review_frame = None
+        self.collection_accept_button.configure(state="disabled")
+        self.collection_reject_button.configure(state="disabled")
+        self.collection_verify_button.configure(
+            state="normal" if decision == "accepted" else "disabled"
+        )
+        self._collection_recording_state = "idle"
+        self._update_collection_buttons()
+        self.collection_status_var.set(
+            f"Sample {sample_id} marked {decision}; "
+            "accepted data remains outside training until explicitly split and exported."
+        )
+        self.collection_camera_status_var.set("Camera ready")
+        if decision == "accepted":
+            self._collection_last_accepted_id = sample_id
+        self._refresh_collection_dashboard()
+
+    def _verify_collection_sample(self) -> None:
+        initial = getattr(self, "_collection_last_accepted_id", "")
+        sample_id = simpledialog.askstring(
+            "Sample ID",
+            "Sample ID for independently reviewed ground truth:",
+            initialvalue=initial,
+            parent=self.root,
+        )
+        if sample_id is None:
+            return
+        ground_truth = simpledialog.askstring(
+            "Independent ground truth",
+            "Enter the sign independently observed in the recording (not the target):",
+            parent=self.root,
+        )
+        if ground_truth is None:
+            return
+        if ground_truth.strip() not in self.vocab:
+            messagebox.showerror(
+                "Ground truth",
+                "Choose a label exactly as it appears in the model vocabulary.",
+                parent=self.root,
+            )
+            return
+        reviewer = simpledialog.askstring(
+            "Reviewer ID",
+            "Anonymous reviewer ID (required, e.g. R001):",
+            parent=self.root,
+        )
+        if reviewer is None:
+            return
+        if not reviewer.strip():
+            messagebox.showerror(
+                "Reviewer ID",
+                "Enter an anonymous reviewer ID to record who verified this label.",
+                parent=self.root,
+            )
+            return
+        notes = simpledialog.askstring(
+            "Review notes",
+            "Optional note about independent review:",
+            parent=self.root,
+        )
+        if notes is None:
+            return
+        try:
+            self.recording_store.verify_ground_truth(
+                sample_id.strip(), ground_truth, reviewer, notes
+            )
+        except (OSError, sqlite3.Error, KeyError, ValueError) as exc:
+            messagebox.showerror("Ground truth", str(exc), parent=self.root)
+            return
+        self.collection_status_var.set(
+            f"Independent ground truth saved for {sample_id}. "
+            "Assign a split using manage_recordings.py."
+        )
+        self._collection_last_accepted_id = ""
+        self._collection_review_landmarks = None
+        self._collection_review_frame = None
+        self._stop_collection_sequence_replay()
+        self._update_collection_buttons()
+        self._refresh_collection_dashboard()
+
     def _populate_targets(self) -> None:
         values: list[str] = []
         for label in self.vocab:
@@ -1438,6 +2967,12 @@ class ASLApplication:
             self.session_id,
             model_version=self.model_version,
             vocabulary_version=self.vocabulary_version,
+            signer_id=self.args.signer_id,
+            environment={"camera_index": self.args.camera},
+            notes=self.args.session_notes,
+            model_checkpoint=str(Path(self.args.ckpt).resolve()),
+            application_version="unknown",
+            model_id=Path(self.args.ckpt).stem,
             configuration={
                 "checkpoint": Path(self.args.ckpt).name,
                 "confidence_threshold": self.args.thr,
@@ -1461,6 +2996,10 @@ class ASLApplication:
             demo_watch_duration=self._demo_watch_duration,
             model_version=self.model_version,
             preprocessing_version=C.PREPROCESSING_VERSION,
+            signer_id=self.args.signer_id,
+            model_checkpoint=str(Path(self.args.ckpt).resolve()),
+            application_version="unknown",
+            model_id=Path(self.args.ckpt).stem,
         )
 
     def _show_testing_report(self) -> None:
@@ -1703,23 +3242,35 @@ class ASLApplication:
             return f"Could not update missing-demo report: {exc}"
         return ""
 
-    def _open_demo_video(self, demo: SignDemo) -> None:
+    def _open_demo_video(
+        self,
+        demo: SignDemo,
+        *,
+        panel: VideoPanel | None = None,
+        status: ttk.Label | None = None,
+        button: ttk.Button | None = None,
+    ) -> None:
+        self._active_video_panel = panel or self.reference_preview
+        self._active_video_status = status or self.demo_video_status
+        self._active_video_button = button or self.replay_button
+        self._video_is_collection = panel is not None
         self._video_capture = cv2.VideoCapture(str(demo.path))
         if not self._video_capture.isOpened():
             self._video_capture.release()
             self._video_capture = None
-            self.demo_video_status.configure(
+            self._active_video_status.configure(
                 text="The verified demo could not be opened. Check the MP4 file."
             )
-            self.replay_button.configure(state="disabled")
-            self.start_attempt_button.configure(state="disabled")
+            self._active_video_button.configure(state="disabled")
+            if panel is None:
+                self.start_attempt_button.configure(state="disabled")
             return
         fps = self._video_capture.get(cv2.CAP_PROP_FPS)
         delay = max(15, round(1000 / fps)) if np.isfinite(fps) and fps > 0 else 40
         self._video_delay_ms = delay
         self._video_playing = True
         self._video_last_tick = 0.0
-        self.replay_button.configure(text="Pause demonstration")
+        self._active_video_button.configure(text="Pause demonstration")
         self._schedule_video_frame(0)
 
     def _schedule_video_frame(self, delay: int | None = None) -> None:
@@ -1739,19 +3290,24 @@ class ASLApplication:
             self._video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ok, frame = self._video_capture.read()
         if not ok or frame is None:
-            self.demo_video_status.configure(
-                text="The demo has no readable frames. Check the MP4 before using it."
-            )
+            if self._active_video_status is not None:
+                self._active_video_status.configure(
+                    text="The demo has no readable frames. Check the MP4 before using it."
+                )
             self._stop_demo_video()
             return
         now = time.perf_counter()
-        if self._video_last_tick:
+        if self._video_last_tick and not self._video_is_collection:
             self._demo_watch_duration += min(
                 max(0.0, now - self._video_last_tick),
                 self._video_delay_ms / 1000 * 1.5,
             )
         self._video_last_tick = now
-        if not self._demo_watched and self.session_id is not None:
+        if (
+            not self._video_is_collection
+            and not self._demo_watched
+            and self.session_id is not None
+        ):
             self.attempt_store.record_event(
                 self.session_id,
                 "demo_watched",
@@ -1763,8 +3319,10 @@ class ASLApplication:
                     ),
                 },
             )
-        self._demo_watched = True
-        self.reference_preview.show_frame(frame)
+        if not self._video_is_collection:
+            self._demo_watched = True
+        if self._active_video_panel is not None:
+            self._active_video_panel.show_frame(frame)
         self._schedule_video_frame()
 
     def _toggle_demo_video(self) -> None:
@@ -1779,12 +3337,25 @@ class ASLApplication:
     def _stop_demo_video(self) -> None:
         self._video_playing = False
         self._video_last_tick = 0.0
+        active_button = self._active_video_button
+        collection_video = self._video_is_collection
         if self._video_after_id is not None:
             self.root.after_cancel(self._video_after_id)
             self._video_after_id = None
         if self._video_capture is not None:
             self._video_capture.release()
             self._video_capture = None
+        if active_button is not None:
+            active_button.configure(
+                text=(
+                    "Play verified reference"
+                    if collection_video else "Replay demonstration"
+                )
+            )
+        self._active_video_panel = None
+        self._active_video_status = None
+        self._active_video_button = None
+        self._video_is_collection = False
 
     def _bind_shortcuts(self) -> None:
         self.root.bind("c", lambda _: self._clear_subtitle())
@@ -1795,15 +3366,24 @@ class ASLApplication:
 
     def _show_mode(self, mode: str) -> None:
         previous_mode = self._current_mode
+        if mode != "collection":
+            self._stop_collection_sequence_replay()
         if mode == "testing" or previous_mode == "testing":
             self.subtitle_manager.clear()
+        if mode == "testing" and not self._selected_label:
+            self._select_initial_target()
         self._current_mode = mode
         if mode == "testing":
             self._ensure_testing_session()
         self._stop_demo_video()
         self.demo_page.grid_remove()
         self.testing_page.grid_remove()
-        page = self.demo_page if mode == "demo" else self.testing_page
+        self.collection_page.grid_remove()
+        page = {
+            "demo": self.demo_page,
+            "testing": self.testing_page,
+            "collection": self.collection_page,
+        }[mode]
         page.grid(row=0, column=0, sticky="nsew")
         self.mode_switch_button.configure(
             text="Testing Mode" if mode == "demo" else "Demo Mode"
@@ -1813,6 +3393,7 @@ class ASLApplication:
             self.status_label.grid_remove()
             self.mode_switch_button.place_configure(y=40)
             self.sound_button.place_configure(y=40)
+            self.demo_retry_button.place_forget()
         else:
             self.header.grid()
             self.status_label.grid()
@@ -1826,15 +3407,20 @@ class ASLApplication:
             self.demo_count_label.configure(
                 text=f"{len(self.catalog)} of {len(self.vocab)} verified demos"
             )
-        self.status_var.set(
-            "C=clear subtitle · L=toggle landmarks · Q=quit"
-            if mode == "demo"
-            else (
+        if mode == "collection":
+            self._update_collection_reference()
+            self._refresh_collection_dashboard()
+            self.status_var.set(
+                "Self-recording Studio · captured samples are review candidates, not training data."
+            )
+        elif mode == "demo":
+            self.status_var.set("C=clear subtitle · L=toggle landmarks · Q=quit")
+        else:
+            self.status_var.set(
                 "Guided test · reference demos are optional; reviewed ground truth is required for accuracy."
                 if self.vocab
                 else "Guided testing is unavailable because the checkpoint vocabulary is empty."
             )
-        )
         if mode == "testing" and self._missing_report_error:
             self.status_var.set(
                 f"{self.status_var.get()} · {self._missing_report_error}"
@@ -1856,6 +3442,16 @@ class ASLApplication:
         if mode == self._current_mode or self._transitioning:
             return
         if self.worker is not None:
+            if (
+                self.worker.mode == "collection"
+                and self.worker.recording
+                and not messagebox.askyesno(
+                    "Discard current recording?",
+                    "Switching modes will discard the unfinished recording. Continue?",
+                    parent=self.root,
+                )
+            ):
+                return
             if self.worker.current_attempt_id is not None and not messagebox.askyesno(
                 "Discard unfinished attempt?",
                 "Switching modes will discard this unfinished attempt. "
@@ -1865,6 +3461,9 @@ class ASLApplication:
                 return
             if self.worker.current_attempt_id is not None:
                 self._end_active_attempt("cancelled", "Mode changed before completion.")
+            if self._collection_countdown_after is not None:
+                self.root.after_cancel(self._collection_countdown_after)
+                self._collection_countdown_after = None
             self._transitioning = True
             self._pending_mode = mode
             self.speech.cancel_pending()
@@ -1896,6 +3495,7 @@ class ASLApplication:
         demo: SignDemo | None = None,
         target_label: str | None = None,
         attempt_id: int | None = None,
+        collection_video_path: Path | None = None,
     ) -> RecognitionWorker | None:
         if self.worker is not None:
             return None
@@ -1916,11 +3516,14 @@ class ASLApplication:
             session_id=self.session_id or "",
             store=self.attempt_store,
             attempt_id=attempt_id,
+            collection_video_path=collection_video_path,
         )
         self.worker.start()
+        self._last_error = ""
         if mode == "demo":
+            self.demo_retry_button.place_forget()
             self.demo_preview.show_placeholder("Connecting to camera…")
-        else:
+        elif mode == "testing":
             self.test_attempt_button.configure(
                 text="Starting camera…", state="disabled"
             )
@@ -1928,6 +3531,12 @@ class ASLApplication:
             self.target_selector.configure(state="disabled")
             self.test_camera_status.configure(text="Connecting…")
             self.test_preview.show_placeholder("Connecting to camera…")
+        else:
+            self._collection_camera_state = "starting"
+            self._collection_recording_state = "idle"
+            self._update_collection_buttons()
+            self.collection_camera_status_var.set("Connecting to camera…")
+            self.collection_preview.show_placeholder("Connecting to camera…")
         return self.worker
 
     def _start_test_attempt(self) -> None:
@@ -2007,6 +3616,7 @@ class ASLApplication:
             attempt_id,
             status=status,
             error=reason,
+            frame_count=self.worker._attempt_frame_count,
         )
         self.worker.current_attempt_id = None
         self.status_var.set(f"Attempt #{attempt_id} saved as {saved_status}.")
@@ -2055,9 +3665,23 @@ class ASLApplication:
                 preview = (
                     self.demo_preview
                     if self.worker.mode == "demo"
+                    else self.collection_preview
+                    if self.worker.mode == "collection"
                     else self.test_preview
                 )
-                preview.show_frame(frame)
+                if (
+                    self.worker.mode == "collection"
+                    and (
+                        self._collection_pending_id is not None
+                        or self._collection_preview_result is not None
+                    )
+                    and self._collection_review_frame is not None
+                ):
+                    self.collection_preview.show_frame(
+                        self._collection_review_frame
+                    )
+                else:
+                    preview.show_frame(frame)
                 commit = self.worker.commit_info
                 if commit is not None and commit[0] > self.worker._last_rendered_commit:
                     now = time.perf_counter()
@@ -2076,7 +3700,12 @@ class ASLApplication:
                 if stopped_mode == "demo":
                     placeholder = self._last_error or "Camera is off"
                     self.demo_preview.show_placeholder(placeholder)
-                else:
+                    if self._last_error:
+                        self.demo_retry_button.place(
+                            relx=0.5, rely=0.5, anchor="center"
+                        )
+                        self.demo_retry_button.configure(state="normal")
+                elif stopped_mode == "testing":
                     self.test_camera_status.configure(text="Camera off")
                     self.test_attempt_button.configure(
                         text="Camera starts when you begin", state="normal"
@@ -2085,6 +3714,37 @@ class ASLApplication:
                     self.target_selector.configure(
                         state="readonly" if self.vocab else "disabled"
                     )
+                else:
+                    stopped_during_recording = (
+                        self._collection_recording_state
+                        in {"countdown", "starting", "recording", "saving", "cancelling"}
+                    )
+                    self._collection_camera_state = (
+                        "error" if self._last_error else "off"
+                    )
+                    if self._collection_countdown_after is not None:
+                        self.root.after_cancel(self._collection_countdown_after)
+                        self._collection_countdown_after = None
+                        self._collection_recording_state = "idle"
+                        self._set_collection_metadata_enabled(True)
+                    if self._collection_pending_id is None:
+                        self._collection_recording_state = "idle"
+                        self._set_collection_metadata_enabled(True)
+                    self.collection_preview.show_placeholder(
+                        self._last_error or "Camera is off"
+                    )
+                    self.collection_camera_status_var.set(
+                        f"Camera unavailable: {self._last_error}"
+                        if self._last_error
+                        else "Camera is off"
+                    )
+                    if self._collection_pending_id is None:
+                        self._collection_recording_state = "idle"
+                        if stopped_during_recording and not self._last_error:
+                            self.collection_status_var.set(
+                                "Camera stopped. The unfinished recording was discarded."
+                            )
+                    self._update_collection_buttons()
                 if self._transitioning:
                     self._transitioning = False
                     pending_mode = self._pending_mode
@@ -2096,6 +3756,12 @@ class ASLApplication:
                     text="Finish attempt", state="normal"
                 )
                 self.test_camera_status.configure(text="Recording")
+            elif self.worker.mode == "collection":
+                if self.worker.recording:
+                    self._collection_recording_state = "recording"
+                    self._update_collection_buttons()
+                elif self._collection_pending_id is None:
+                    self._update_collection_buttons()
         if self.args.debug_performance:
             now = time.perf_counter()
             if now - self._last_performance_report >= 5.0:
@@ -2122,12 +3788,45 @@ class ASLApplication:
             if event == "camera_ready":
                 if value == "demo":
                     self._last_error = ""
+                    self.demo_retry_button.place_forget()
+                elif value == "collection":
+                    self._last_error = ""
+                    self._collection_camera_state = "ready"
+                    self._collection_recording_state = "idle"
+                    self._update_collection_buttons()
+                    self.collection_camera_status_var.set("Camera ready")
+                    self.collection_status_var.set(
+                        "Camera ready. Review the sign and conditions, then record."
+                    )
                 else:
                     self.test_camera_status.configure(text="Camera active")
                     self.test_attempt_button.configure(
                         text="Finish attempt", state="normal"
                     )
                     self.status_var.set("Camera active · perform the target sign.")
+            elif event == "collection_started":
+                self._collection_recording_state = "recording"
+                self._update_collection_buttons()
+                self.collection_camera_status_var.set("Camera ready · recording")
+                self.collection_status_var.set(
+                    f"Recording {self._collection_metadata.get('target_label', '')}…"
+                )
+            elif event == "collection_ready":
+                self._on_collection_ready(value)
+            elif event == "collection_error":
+                self.collection_status_var.set(value)
+                self._collection_recording_state = "idle"
+                self._set_collection_metadata_enabled(True)
+                self._update_collection_buttons()
+            elif event == "collection_cancelled":
+                self._collection_sample_id = ""
+                self._collection_recording_state = "idle"
+                self._set_collection_metadata_enabled(True)
+                self._update_collection_buttons()
+                self.collection_camera_status_var.set("Camera ready")
+                self.collection_status_var.set(
+                    "Recording cancelled. Captured frames were discarded; no sample was saved."
+                )
             elif event in ("prediction", "subtitle"):
                 pass
             elif event == "committed":
@@ -2173,8 +3872,17 @@ class ASLApplication:
                         text=(
                             f"Stable prediction: {best.canonical_label}\n"
                             f"Confidence: {best.confidence:.0%}\n"
+                            + "\n".join(
+                                f"Top {index}: {item.canonical_label} "
+                                f"({item.confidence:.1%})"
+                                for index, item in enumerate(
+                                    result["predictions"][:3], start=1
+                                )
+                            )
+                            + "\n"
                             f"Saved attempt #{result['attempt_id']} · "
-                            "ground truth is unverified"
+                            "ground truth is unverified\n"
+                            f"Replay sequence: {result['sequence_path']}"
                         )
                     )
                 elif result["status"] == "no_prediction":
@@ -2248,9 +3956,29 @@ class ASLApplication:
             elif event == "worker_error":
                 self._last_error = value
                 self.status_var.set(value)
-                if self.worker is not None and self.worker.mode == "testing":
+                if self.worker is not None and self.worker.mode == "demo":
+                    self.demo_retry_button.place(
+                        relx=0.5, rely=0.5, anchor="center"
+                    )
+                    self.demo_retry_button.configure(state="disabled")
+                elif self.worker is not None and self.worker.mode == "testing":
                     self.test_camera_status.configure(text="Camera unavailable")
                     self.test_result.configure(text=value)
+                elif self.worker is not None and self.worker.mode == "collection":
+                    self._collection_camera_state = "stopping"
+                    if self._collection_countdown_after is not None:
+                        self.root.after_cancel(self._collection_countdown_after)
+                        self._collection_countdown_after = None
+                        self._collection_countdown_remaining = 0
+                        self._collection_recording_state = "idle"
+                        self._set_collection_metadata_enabled(True)
+                    self.collection_camera_status_var.set(
+                        f"Camera/collection error: {value}"
+                    )
+                    self.collection_status_var.set(
+                        f"Camera/collection error: {value}"
+                    )
+                    self._update_collection_buttons()
             elif event == "speech_engine_ready":
                 self._ui_performance.add("speech_engine_startup", value)
             elif event == "speech_error":
@@ -2274,6 +4002,10 @@ class ASLApplication:
                     self.demo_preview.show_placeholder(
                         self._last_error or "Camera is off"
                     )
+                elif value == "collection":
+                    self.collection_preview.show_placeholder(
+                        self._last_error or "Camera is off"
+                    )
                 else:
                     self.test_preview.show_placeholder("Camera is off")
             self.events.task_done()
@@ -2281,7 +4013,41 @@ class ASLApplication:
     def _request_close(self) -> None:
         if self._closing:
             return
+        if self._collection_preview_result is not None:
+            if not messagebox.askyesno(
+                "Discard unsaved preview?",
+                "Closing now discards the unsaved preview. Continue?",
+                parent=self.root,
+            ):
+                return
+            video_path = self._collection_preview_result.get("raw_video_path")
+            try:
+                if video_path:
+                    Path(video_path).unlink(missing_ok=True)
+            except OSError as exc:
+                messagebox.showerror(
+                    "Preview cleanup failed",
+                    f"The unsaved preview could not be removed: {exc}",
+                    parent=self.root,
+                )
+                return
+            self._collection_preview_result = None
+        if (
+            self.worker is not None
+            and self.worker.mode == "collection"
+            and self.worker.recording
+            and not messagebox.askyesno(
+                "Discard current recording?",
+                "Closing now discards the unfinished recording. Continue?",
+                parent=self.root,
+            )
+        ):
+            return
         self._closing = True
+        self._stop_collection_sequence_replay()
+        if self._collection_countdown_after is not None:
+            self.root.after_cancel(self._collection_countdown_after)
+            self._collection_countdown_after = None
         self._stop_demo_video()
         self.speech.close()
         if self.session_id is not None:
@@ -2310,6 +4076,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--mode", choices=("demo", "recognition", "testing"), default="demo")
     parser.add_argument("--target", default="", help="initial testing target label")
+    parser.add_argument(
+        "--recording-db",
+        default=str(C.SELF_RECORDING_DB),
+        help="SQLite database for Self-recording Studio samples",
+    )
+    parser.add_argument(
+        "--signer-id",
+        default="",
+        help="optional anonymous signer ID for the Testing Mode evaluation session",
+    )
+    parser.add_argument(
+        "--session-notes",
+        default="",
+        help="optional Testing Mode environment/session notes",
+    )
     parser.add_argument("--min-votes", type=int, default=5)
     parser.add_argument("--cooldown", type=float, default=0.8)
     parser.add_argument(

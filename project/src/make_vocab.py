@@ -16,6 +16,7 @@ import random
 import pandas as pd
 
 import config as C
+from model_vocabulary import validate_vocabulary
 
 
 def load_split(path):
@@ -72,6 +73,7 @@ def main():
         chosen = sorted(ok.sort_values("train", ascending=False, kind="stable").index[: args.n])
     else:
         chosen = sorted(random.Random(args.seed).sample(sorted(ok.index), args.n))
+    chosen = validate_vocabulary(chosen)
 
     C.DATA.mkdir(parents=True, exist_ok=True)
     (C.DATA / "vocab.txt").write_text("\n".join(chosen) + "\n", encoding="utf-8")

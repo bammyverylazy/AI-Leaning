@@ -27,6 +27,24 @@ _ATTEMPT_COLUMNS = {
     "duration_seconds": "REAL",
     "error": "TEXT",
     "warning": "TEXT",
+    "signer_id": "TEXT NOT NULL DEFAULT ''",
+    "model_checkpoint": "TEXT NOT NULL DEFAULT ''",
+    "application_version": "TEXT NOT NULL DEFAULT 'unknown'",
+    "sequence_path": "TEXT NOT NULL DEFAULT ''",
+    "sequence_length": "INTEGER",
+    "feature_dimension": "INTEGER",
+    "frame_count": "INTEGER NOT NULL DEFAULT 0",
+    "model_id": "TEXT NOT NULL DEFAULT 'unknown'",
+    "vocabulary_version": "TEXT NOT NULL DEFAULT 'unknown'",
+}
+
+_SESSION_COLUMNS = {
+    "signer_id": "TEXT NOT NULL DEFAULT ''",
+    "environment_json": "TEXT NOT NULL DEFAULT '{}'",
+    "notes": "TEXT NOT NULL DEFAULT ''",
+    "model_checkpoint": "TEXT NOT NULL DEFAULT ''",
+    "application_version": "TEXT NOT NULL DEFAULT 'unknown'",
+    "model_id": "TEXT NOT NULL DEFAULT 'unknown'",
 }
 
 _TERMINAL_ATTEMPT_STATUSES = {
@@ -85,6 +103,15 @@ class RecognitionAttemptStore:
                 )
                 """
             )
+            session_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(testing_sessions)")
+            }
+            for name, definition in _SESSION_COLUMNS.items():
+                if name not in session_columns:
+                    connection.execute(
+                        f"ALTER TABLE testing_sessions ADD COLUMN {name} {definition}"
+                    )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS recognition_attempts (
@@ -157,6 +184,20 @@ class RecognitionAttemptStore:
             )
             connection.execute(
                 """
+                INSERT OR IGNORE INTO testing_sessions (
+                    session_id, status, model_version, vocabulary_version,
+                    configuration_json, notes
+                )
+                SELECT 'legacy', 'completed', 'unknown', 'unknown', '{}',
+                       'Migrated attempts without a Testing Mode session record.'
+                WHERE EXISTS (
+                    SELECT 1 FROM recognition_attempts
+                    WHERE session_id = 'legacy'
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS recognition_attempt_reviews (
                     review_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     attempt_id INTEGER NOT NULL REFERENCES recognition_attempts(attempt_id),
@@ -217,21 +258,42 @@ class RecognitionAttemptStore:
         model_version: str,
         vocabulary_version: str,
         configuration: dict,
+        signer_id: str = "",
+        environment: dict | None = None,
+        notes: str = "",
+        model_checkpoint: str = "",
+        application_version: str = "unknown",
+        model_id: str = "unknown",
     ) -> str:
         if not session_id.strip() or not model_version.strip() or not vocabulary_version.strip():
             raise ValueError("session ID and version identifiers must not be empty")
         encoded_configuration = json.dumps(
             configuration, ensure_ascii=False, allow_nan=False, sort_keys=True
         )
+        encoded_environment = json.dumps(
+            environment or {}, ensure_ascii=False, allow_nan=False, sort_keys=True
+        )
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO testing_sessions (
                     session_id, status, model_version, vocabulary_version,
-                    configuration_json
-                ) VALUES (?, 'active', ?, ?, ?)
+                    configuration_json, signer_id, environment_json, notes,
+                    model_checkpoint, application_version, model_id
+                ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, model_version, vocabulary_version, encoded_configuration),
+                (
+                    session_id,
+                    model_version,
+                    vocabulary_version,
+                    encoded_configuration,
+                    signer_id.strip(),
+                    encoded_environment,
+                    notes.strip(),
+                    model_checkpoint.strip(),
+                    application_version.strip() or "unknown",
+                    model_id.strip() or "unknown",
+                ),
             )
             self._insert_event(
                 connection, session_id, None, "session_started",
@@ -319,6 +381,10 @@ class RecognitionAttemptStore:
         demo_video_version: str = "",
         demo_watched: bool = False,
         demo_watch_duration: float = 0.0,
+        signer_id: str = "",
+        model_checkpoint: str = "",
+        application_version: str = "unknown",
+        model_id: str = "unknown",
     ) -> int:
         if not all(
             value.strip()
@@ -335,7 +401,7 @@ class RecognitionAttemptStore:
             raise ValueError("demo_watch_duration must be finite and non-negative")
         with self._connect() as connection:
             session = connection.execute(
-                "SELECT status FROM testing_sessions WHERE session_id = ?",
+                "SELECT * FROM testing_sessions WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
             if session is None or session["status"] != "active":
@@ -347,8 +413,10 @@ class RecognitionAttemptStore:
                     demo_watched, demo_watch_duration, predicted_label,
                     original_model_label, canonical_label, top_k_predictions,
                     confidence, model_version, preprocessing_version, status,
-                    started_at, timestamp
+                    signer_id, model_checkpoint, application_version,
+                    model_id, vocabulary_version, started_at, timestamp
                 ) VALUES (?, ?, ?, ?, ?, ?, '', '', '', '[]', 0, ?, ?, 'in_progress',
+                    ?, ?, ?, ?, ?,
                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                 """,
@@ -361,6 +429,19 @@ class RecognitionAttemptStore:
                     demo_watch_duration,
                     model_version,
                     preprocessing_version,
+                    signer_id.strip() or session["signer_id"],
+                    model_checkpoint.strip() or session["model_checkpoint"],
+                    (
+                        application_version.strip()
+                        if application_version.strip() != "unknown"
+                        else session["application_version"]
+                    ),
+                    (
+                        model_id.strip()
+                        if model_id.strip() != "unknown"
+                        else session["model_id"]
+                    ),
+                    session["vocabulary_version"],
                 ),
             )
             attempt_id = cursor.lastrowid
@@ -401,6 +482,10 @@ class RecognitionAttemptStore:
         top_k_predictions: list[dict] | None = None,
         confidence: float = 0.0,
         inference_latency_ms: float | None = None,
+        sequence_path: str = "",
+        sequence_length: int | None = None,
+        feature_dimension: int | None = None,
+        frame_count: int = 0,
         error: str | None = None,
         warning: str | None = None,
     ) -> str:
@@ -426,6 +511,22 @@ class RecognitionAttemptStore:
         ):
             raise ValueError("inference_latency_ms must be finite and non-negative")
         encoded_top_k = _validate_top_k(top_k_predictions)
+        if (
+            isinstance(frame_count, bool)
+            or not isinstance(frame_count, int)
+            or frame_count < 0
+        ):
+            raise ValueError("frame_count must be a non-negative integer")
+        for name, value in (
+            ("sequence_length", sequence_length),
+            ("feature_dimension", feature_dimension),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer")
+        if sequence_path and (sequence_length is None or feature_dimension is None):
+            raise ValueError("sequence metadata is required when a sequence path is set")
         with self._connect() as connection:
             attempt = connection.execute(
                 """
@@ -444,6 +545,8 @@ class RecognitionAttemptStore:
                 SET predicted_label = ?, original_model_label = ?,
                     canonical_label = ?, class_index = ?, top_k_predictions = ?,
                     confidence = ?, inference_latency_ms = ?, status = ?,
+                    sequence_path = ?, sequence_length = ?, feature_dimension = ?,
+                    frame_count = ?,
                     ended_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                     duration_seconds = MAX(0, (julianday('now') - julianday(started_at)) * 86400),
                     error = ?, warning = ?
@@ -458,6 +561,10 @@ class RecognitionAttemptStore:
                     confidence,
                     inference_latency_ms,
                     status,
+                    sequence_path,
+                    sequence_length,
+                    feature_dimension,
+                    frame_count,
                     error,
                     warning,
                     attempt_id,

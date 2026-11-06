@@ -34,6 +34,7 @@ from dataset import build_features, preprocess_sequence
 from extract import make_landmarker, result_to_array
 from label_display import aggregate_predictions
 from model import SeqClassifier
+from model_vocabulary import checkpoint_vocabulary
 from subtitle import State, SubtitleManager
 
 # ---- ตัวเลขสีสำหรับ OpenCV (BGR) ----
@@ -137,10 +138,10 @@ def run(args):
     # ---- โหลดโมเดล ----
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     a = ck["args"]
-    model = SeqClassifier(ck["feature_dim"], len(ck["vocab"]), a["hidden"], 2, a["dropout"], a["kind"])
+    vocab = checkpoint_vocabulary(ck)
+    model = SeqClassifier(ck["feature_dim"], len(vocab), a["hidden"], 2, a["dropout"], a["kind"])
     model.load_state_dict(ck["model"])
     model.eval()
-    vocab = ck["vocab"]
     n_classes = len(vocab)
     print(f"Model loaded: {args.ckpt}  |  {n_classes} classes  |  feature_dim {ck['feature_dim']}")
 

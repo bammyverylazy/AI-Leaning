@@ -1,8 +1,12 @@
 .venv
 .venv-1
 .project/data/raw/
+.project/data/self_recorded/
+.project/data/sign_demos/
+.project/reports/
+*.avi
 *.csv
-
+*.pyc
 *.npy
 *.npz
 *.mp4

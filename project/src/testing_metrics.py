@@ -55,6 +55,23 @@ def build_report(
         normalize(row["ground_truth_label"]) == prediction(row)
         for row in verified
     )
+    confidence_buckets: dict[str, list[bool]] = {
+        "low (<50%)": [],
+        "medium (50-<75%)": [],
+        "high (>=75%)": [],
+    }
+    for row in verified:
+        confidence = float(row.get("confidence") or 0.0)
+        bucket = (
+            "low (<50%)"
+            if confidence < 0.5
+            else "medium (50-<75%)"
+            if confidence < 0.75
+            else "high (>=75%)"
+        )
+        confidence_buckets[bucket].append(
+            normalize(row["ground_truth_label"]) == prediction(row)
+        )
 
     top_k_samples: dict[int, list[tuple[str, list[str]]]] = {
         3: [],
@@ -134,6 +151,11 @@ def build_report(
         )
 
     statuses = Counter(str(row.get("status", "completed")) for row in rows)
+    coverage_denominator = len(valid) + statuses["no_prediction"]
+    answered_verified = [
+        row for row in verified
+        if row.get("status", "completed") == "completed"
+    ]
     missing_prediction = sum(
         row.get("status", "completed") == "completed" and not prediction(row)
         for row in rows
@@ -157,8 +179,9 @@ def build_report(
         [
             "No webcam recording of the performed sign is stored; retrospective "
             "verification requires an independent observer or external evidence.",
-            "Tester identity/repeated-user effects are not tracked, and this controlled "
-            "prototype does not establish performance in other environments.",
+            "Signer IDs are optional and should be pseudonymous; repeated-user effects "
+            "cannot be analyzed when IDs are omitted. This controlled prototype does "
+            "not establish performance in other environments.",
         ]
     )
 
@@ -189,6 +212,37 @@ def build_report(
             "correct": verified_correct,
             "total": len(verified),
             "accuracy": verified_correct / len(verified) if verified else None,
+        },
+        "coverage": {
+            "total_attempts": len(rows),
+            "eligible_attempts": coverage_denominator,
+            "answered": len(valid),
+            "rejected": statuses["no_prediction"],
+            "coverage": (
+                len(valid) / coverage_denominator if coverage_denominator else None
+            ),
+            "answered_verified_correct": sum(
+                normalize(row["ground_truth_label"]) == prediction(row)
+                for row in answered_verified
+            ),
+            "answered_verified_total": len(answered_verified),
+            "answered_verified_accuracy": (
+                sum(
+                    normalize(row["ground_truth_label"]) == prediction(row)
+                    for row in answered_verified
+                )
+                / len(answered_verified)
+                if answered_verified else None
+            ),
+        },
+        "confidence_analysis": {
+            label: {
+                "correct": sum(outcomes),
+                "incorrect": len(outcomes) - sum(outcomes),
+                "total": len(outcomes),
+                "accuracy": sum(outcomes) / len(outcomes) if outcomes else None,
+            }
+            for label, outcomes in confidence_buckets.items()
         },
         "verified_top_k": {
             k: {
@@ -233,6 +287,7 @@ def format_report(report: dict[str, Any]) -> str:
         f"Status: {session.get('status', 'all')}",
         f"Started: {session.get('started_at', 'not recorded')}",
         f"Model: {session.get('model_version', 'mixed / not recorded')}",
+        f"Signer: {session.get('signer_id') or 'not recorded'}",
         f"Attempts: {counts['total']} total · {counts['completed']} completed · "
         f"{counts['valid']} valid · {counts['verified']} verified",
         "Data quality: "
@@ -253,6 +308,28 @@ def format_report(report: dict[str, Any]) -> str:
         "Verified Top-1 Accuracy: "
         + _format_rate(top1["accuracy"], top1["correct"], top1["total"])
     )
+    coverage = report["coverage"]
+    lines.append(
+        "Coverage: "
+        + _format_rate(
+            coverage["coverage"], coverage["answered"], coverage["eligible_attempts"]
+        )
+        + f" · {coverage['answered']} answered · {coverage['rejected']} rejected"
+    )
+    lines.append(
+        "Verified accuracy among answered: "
+        + _format_rate(
+            coverage["answered_verified_accuracy"],
+            coverage["answered_verified_correct"],
+            coverage["answered_verified_total"],
+        )
+    )
+    lines.extend(["", "VERIFIED ACCURACY BY CONFIDENCE"])
+    for label, result in report["confidence_analysis"].items():
+        lines.append(
+            f"{label}: "
+            + _format_rate(result["accuracy"], result["correct"], result["total"])
+        )
     for k, result in report["verified_top_k"].items():
         if result["total"] == 0:
             continue

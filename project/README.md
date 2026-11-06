@@ -205,7 +205,9 @@ If the same person appears in training and test, the model can memorize *that pe
 | `extract.py` | Runs MediaPipe on every frame, saves `[T, 98, 3]` per video, logs hand-detection ratio | Slowest step; parallel and resumable |
 | `dataset.py` | Cleans, normalizes, resamples, builds features, defines augmentation and the PyTorch `Dataset` | Turns raw points into learnable input |
 | `model.py` | Defines the BiGRU/BiLSTM classifier | Stage 2 |
-| `train.py` | Trains, picks best epoch on validation, evaluates on test, writes reports | Honest evaluation |
+| `audit_dataset.py` | Audits metadata, local videos, landmarks, features, checkpoint classes, and UI coverage | Traceable class coverage |
+| `model_vocabulary.py` | Validates ordered class identities and checkpoint class mappings | Prevents index drift |
+| `train.py` | Validates split inputs, trains a separate candidate by default, evaluates, writes reports | Safe candidate training |
 | `application.py`, `demo.py` | Unified Demo/Testing desktop interface and camera workflow | User-facing application |
 | `speech.py` | Asynchronous offline Windows SAPI speech for committed subtitle entries | Speech feedback |
 
@@ -306,6 +308,66 @@ Speech uses the computer's installed Windows **System.Speech/SAPI** English voic
 
 Testing mode is a page in the same application. Choose a target from the checkpoint vocabulary. If a verified reference video is available, replay it in the embedded preview; otherwise, the attempt can still proceed and the report marks it as having no reference. Missing references do not disable target selection, including after the camera stops. Select **Start attempt**, perform one sign, then select **Finish attempt**. Live predictions pass through the same MediaPipe, preprocessing, model, and subtitle stabilizer as Demo mode; only a stabilized prediction is saved as a model result. Attempts are initialized in SQLite before recognition and remain unverified until an independent reviewer records the actual performed sign. Short, cancelled, interrupted, errored, and no-prediction attempts are retained with explicit statuses and excluded from verified accuracy.
 
+### Self-recording Studio
+
+To record a sample:
+
+1. In Demo, click **Testing Mode** in the top-right. In Testing, choose a target sign, then click **Self-recording Studio**.
+2. Select the target sign, choose an existing pseudonymous **Anonymous signer ID** or type a new one (for example `S001`), set the dominant hand and camera conditions, then click **Start recording session**. Do not enter real names. The session ID is shown in the Studio and is shared by clips recorded in that session; start a new session when the signer or session changes.
+3. Keep **Keep raw video** unchecked unless you have consent and a reason to retain identifiable video. Click **Start camera** and wait for the camera-active message.
+4. Click **Record sample**. After the 3-second countdown, perform one complete sign in view, then click **Finish recording**. Click **Cancel recording** during the countdown or capture to discard it without saving a sample.
+5. Inspect the captured landmark preview, metadata, and any quality warnings. Click **Save pending-review candidate** to persist it, or **Discard preview** to delete it without creating a sample. A saved candidate can then be explicitly accepted or rejected. Acceptance does **not** set a ground-truth label; use the separate independent-verification action only after checking what was actually performed.
+
+The **Self-recording Studio** collects one sign at a time for later review. Each new record stores a unique sample ID, the target prompt, an initially null ground-truth label, signer and session IDs, recording time, dominant hand, camera source and conditions, and recording/verification/quality states. Accepted recordings remain **accepted but unverified**; only explicitly verified labels with valid sequence metadata and passed structural checks can be assigned to a dataset split.
+
+The Studio saves variable-length raw landmarks plus the exact 64-frame normalized positions, hand-presence flags, and model-ready feature sequence. Quality checks require at least 8 captured frames and hand landmarks in at least 3 frames; a hand-detection ratio below 40% is shown as a warning for review. Camera index, angle, distance, lighting, signing speed, optional notes, model/checkpoint hash, preprocessing version, and review status are retained. The live preview is mirrored for the signer; landmark input remains in the training orientation.
+
+Raw webcam video is **off by default**. Enable **Save optional raw video** only when needed and with the signer's consent. Video is stored as a silent MJPG AVI; no audio is captured. Landmark sequences are stored separately from public training features under `data/self_recorded/` (`staging/`, `accepted/`, `rejected/`, and optional `raw/`). Collection never edits or merges into the training dataset automatically.
+
+Keep all samples from a signer in one split. New recordings require an anonymous signer ID and session ID; historical recordings with missing identifiers remain unknown and are not silently backfilled. Assign a split only after acceptance and explicit independent ground-truth verification; duplicate source recordings and derived sequences cannot be assigned twice, and signer overlap across splits is blocked. Treat `final_test` and `real_world_eval` as locked evaluation sets. For example, from the `project` folder:
+
+```powershell
+python src\manage_recordings.py dashboard
+python src\manage_recordings.py inspect SAMPLE_ID
+python src\manage_recordings.py verify SAMPLE_ID --ground-truth AXE1 --reviewer-id reviewer-01
+python src\manage_recordings.py assign-split SAMPLE_ID --split train
+python src\manage_recordings.py replay SAMPLE_ID --checkpoint models\gru_seed3.pt
+python src\manage_recordings.py export --split train --output data\self_recorded\exports\train
+```
+
+To review a saved sample, open the Studio's **Review queue**, select its row, and inspect the animated landmark-sequence preview and capture metadata. Accepting a sample records technical/review acceptance only. Rejecting requires a reason. To make a sample eligible for a later dataset split, separately verify the actual sign (never copy the target prompt automatically), enter an anonymous reviewer ID, then assign its signer to exactly one split. The command-line review path is also available:
+
+```powershell
+python src\manage_recordings.py pending
+python src\manage_recordings.py review SAMPLE_ID --decision accepted --notes "Clear sequence"
+python src\manage_recordings.py review SAMPLE_ID --decision rejected --rejection-reason "Hands are occluded"
+python src\manage_recordings.py verify SAMPLE_ID --ground-truth AXE1 --reviewer-id R001
+python src\manage_recordings.py assign-split SAMPLE_ID --split train
+```
+
+Only records with a structurally valid, hash-matching sequence, explicit verified ground truth, passed technical quality checks, and signer/session provenance are exported as model features. The prepared files remain separate from the source archives. Training integration is opt-in and rejects unverified samples, invalid labels/shapes, duplicate sample/sequence provenance, and signer leakage:
+
+```powershell
+python src\manage_recordings.py prepare-features --output data\self_recorded\features
+python src\train.py --kind gru --seed 0 --self-recorded-features-dir data\self_recorded\features --output models\gru_candidate_self_recorded.pt
+```
+
+The trainer reports class counts before and after integration, records feature-archive hashes and self-recorded sample IDs in the candidate checkpoint/metrics, and evaluates the candidate and compatible `gru_seed3.pt` baseline on the same held-out test loader. It writes top-1/top-5, macro-F1, per-class precision/recall/F1 and counts, and a confusion matrix. Empty self-recorded train data is an error and stops before training; it does not silently fall back to source-only training when the opt-in flag was supplied. The baseline path is protected from use as a training output. `final_test` and `real_world_eval` are not accepted as training splits.
+
+The feature-generation path continues to read only the curated train/validation/test source subsets. No model is retrained by the Studio or by `prepare-features`. Automated camera lifecycle tests use mocked webcam devices; they do not establish that a physical webcam works on a particular computer. For manual hardware validation, try repeated Demo → Testing → Demo transitions, then start/stop the Studio camera and record/cancel/finish a short clip while watching for camera release, preview updates, and status changes.
+
+### Manual webcam validation
+
+Run these checks on the target Windows computer with other camera applications closed:
+
+1. Start `python src\demo.py --ckpt models\gru_seed3.pt`, choose **Start camera**, and confirm the preview and live status update.
+2. Switch to Testing Mode, complete or cancel one attempt, switch back to Demo, and repeat the transition several times without restarting the application. Confirm the previous preview stops and the camera can be reopened.
+3. Open Self-recording Studio, start and stop its camera, then record one short sign. Confirm the landmark preview, metadata, and status are visible.
+4. Cancel a second recording and confirm the UI says it was discarded. Finish another recording and save it as pending review; verify that its sample ID appears in the review queue.
+5. Close the application and confirm the camera indicator is released before reopening it.
+
+These are manual checks, not results from this development environment. The automated suite uses mocked capture devices; no physical webcam test was performed during this work.
+
 Demonstrations are intentionally managed separately from the ASL Citizen training videos:
 
 - Add reviewed MP4/H.264 files under `data/sign_demos/videos/<LABEL>/`.
@@ -324,7 +386,17 @@ python src\demo.py --mode testing --ckpt models\gru_seed3.pt --target AXE1
 
 `--target` selects an initial label from the model vocabulary whether or not a reference video exists.
 
-Testing sessions and attempts are stored in `data/recognition_attempts.sqlite3`. A session records start/end status, model and vocabulary hashes, and the active configuration. Each attempt has a durable ID, target, optional reference video, start/end/duration, explicit status, original model label/class index, canonical prediction, top-3 scores, confidence, inference latency, and an event trace. Ground truth remains empty and correctness remains `unverified` until an independent reviewer supplies the actual performed sign. Existing databases are migrated without deleting prior attempts.
+Testing sessions and attempts are stored in `data/recognition_attempts.sqlite3`. A session records start/end status, anonymous signer ID (if supplied), camera index, session notes, model/checkpoint identity, vocabulary hash, and active configuration. Start a separate app session for each signer and testing condition; use notes to record conditions such as lighting, camera distance, and background. Each attempt has a durable ID and timestamp, requested target, optional reference video and version, start/end/duration, explicit status, signer/model/vocabulary/preprocessing/app versions, original model label/class index, canonical prediction, top-3 scores, confidence, inference latency, and an event trace.
+
+When a stable prediction completes, the app saves a compressed sequence artifact under `data/evaluation/sequences/` containing the exact 64-frame model input, raw landmarks, normalized positions, hand-presence flags, and metadata. This directory is separate from training features; evaluation artifacts are not automatically used for training. Ground truth remains empty and correctness remains `unverified` until an independent reviewer records the sign actually performed. Existing databases are migrated additively without deleting prior attempts. Legacy attempts without sequence artifacts cannot be replayed.
+
+For repeatable real-world evaluation, keep the same checkpoint and threshold fixed for the run, use a unique anonymous `--signer-id` for each participant, record condition details in `--session-notes`, and collect attempts across all target classes in a randomized order. Have an observer independently record the performed sign (do not infer it from the requested target or model output); verify each attempt afterward. Repeat across multiple held-out signers and conditions, then compare per-signer and per-condition reports. The app stores landmarks/features, not webcam video, so an attempt cannot be retrospectively verified from the artifact alone. Obtain separate consent and record external evidence if retrospective review is required. Do not claim real-world accuracy from target agreement or unverified predictions.
+
+Example session:
+
+```powershell
+python src\demo.py --mode testing --ckpt models\gru_seed3.pt --signer-id signer-01 --session-notes "indoor office; diffuse lighting; camera at eye level"
+```
 
 ```powershell
 python src\manage_attempts.py pending
@@ -334,10 +406,16 @@ python src\manage_attempts.py history --attempt-id 1
 python src\manage_attempts.py sessions
 python src\manage_attempts.py attempts --session-id SESSION_ID
 python src\manage_attempts.py trace --attempt-id 1
+python src\manage_attempts.py inspect 1
+python src\manage_attempts.py replay 1
 python src\manage_attempts.py report --session-id SESSION_ID
+python src\manage_attempts.py report --all-sessions
+python src\manage_attempts.py export --output reports\verified_testing_attempts.csv
 ```
 
-In Testing mode, **History / verify** opens saved attempts and their event traces and accepts independently observed ground truth; **Testing report** displays the current session’s report. `manage_attempts.py report` defaults to the latest session. Corrections append an audit record and preserve the original model prediction. **Target Agreement** compares prediction with requested target and is not ground-truth accuracy. **Verified Top-1/Top-K Accuracy** uses only completed, valid, reviewed attempts and displays its denominator; Top-3/Top-5 are omitted when that depth is not stored. The confusion matrix is withheld below five verified samples. The report flags small samples, unverified attempts, and missing reference videos and notes that no performance recording or tester identity is stored.
+In Testing mode, **History / verify** opens saved attempts and their event traces and accepts independently observed ground truth; **Testing report** displays the current session’s report. `manage_attempts.py report` defaults to the latest session. Corrections append an audit record and preserve the original model prediction. **Target Agreement** compares prediction with requested target and is not ground-truth accuracy. **Verified Top-1/Top-K Accuracy** uses only completed, valid, reviewed attempts and displays its denominator; Top-3/Top-5 are omitted when that depth is not stored. The confusion matrix is withheld below five verified samples. The report flags small samples, unverified attempts, and missing reference videos, and notes that no webcam performance recording is stored. Signer IDs are optional: use pseudonyms, not real identities; without IDs, repeated-user effects cannot be analyzed.
+
+`inspect` displays provenance, target, prediction, verification, sequence dimensions, and the event trace context for one attempt. `replay` re-runs inference from the saved model input and separately reports whether preprocessing the raw landmarks reproduces that input; it refuses to use a checkpoint whose SHA-256 differs from the recorded model version. `report --all-sessions` combines every session (including any mixed signers/conditions), so prefer a per-session report for subgroup comparisons. `export` writes only completed attempts with independently verified ground truth; the CSV is for analysis and is not a training-data import.
 
 User-facing metrics compare canonical labels. Only the metadata-confirmed `WHATFOR1/2/3` aliases are combined as `WHAT FOR`; their original checkpoint class indices remain stored, and top-K is deduplicated after canonicalization. Distinct signs such as `CHRISTMAS1/2` remain separate canonical variants. This means canonical accuracy is an alias-level metric, not strict checkpoint-class accuracy.
 
@@ -427,10 +505,13 @@ python src/extract.py --probe $v     # sanity check of MediaPipe output
 python src/extract.py --limit 20     # small trial, note the time
 python src/extract.py --workers 4    # everything (resumable)
 
-# 4. features and training
+# 4. audit, features, and candidate training
+python src\audit_dataset.py --checkpoint models\gru_seed3.pt
 python src/dataset.py --min-hand-ratio 0.2
-python src/train.py --kind gru  --seed 0
-python src/train.py --kind lstm --seed 0
+python src/train.py --kind gru --seed 0 --output models\gru_candidate.pt
+# Training validates feature labels, shapes, class coverage, and signer separation.
+# Existing checkpoints are not replaced unless --overwrite is explicitly supplied;
+# when supplied, a timestamped backup is made first.
 
 # 5. desktop application
 python src\demo.py --ckpt models\gru_seed3.pt
@@ -476,8 +557,10 @@ asl_project/
 └─ reports/              metrics, curves, confusion matrices, per-signer accuracy
 ```
 
-Files written by `train.py` in `reports/` (for a run named e.g. `gru_seed0`):
-`*_metrics.json`, `*_curves.png`, `*_confusion.png`, `*_top_confusions.csv`, `*_per_signer.csv`.
+`python src\audit_dataset.py` writes exhaustive JSON and readable text coverage reports under `reports\`. They include every raw metadata class and per-class/per-clip coverage statuses, signer overlap, checkpoint class-index mapping, replay checks from saved landmarks, read-only self-recording status/metadata checks, and a fresh evaluation of the selected checkpoint on the existing official test feature archive. That source-dataset score is not a webcam/generalization result; reserve newly collected signers for a future real-world evaluation. The feature-generation path reads only the curated train/validation/test subsets, not `data/self_recorded`.
+
+Files written by `train.py` in `reports/` (for a run named e.g. `gru_candidate`):
+`*_metrics.json`, `*_curves.png`, `*_confusion.png`, `*_top_confusions.csv`, `*_per_signer.csv`, and `*_per_class.csv`. New feature archives embed their ordered vocabulary and class mapping. Before replacing existing feature archives, `dataset.py` makes timestamped backups. Training also cross-checks legacy archives against the active subset CSVs and refuses mismatched labels or signer leakage.
 
 ---
 
@@ -490,6 +573,8 @@ Fill these in from your own runs (do not copy numbers from other papers).
 | BiGRU | | | | | | | |
 | BiLSTM | | | | | | | |
 
+For the current `gru_seed3.pt` audit, see [`reports/model_reality_audit.md`](reports/model_reality_audit.md). The active source-dataset test result is 499/699 top-1 (71.4%); the 444/510 (87.1%) confidence-filtered result covers only 510 examples. Neither is a real-world webcam accuracy claim; no labeled webcam evaluation set is available yet.
+
 Latency on the laptop: landmarks ___ ms/frame, classifier ___ ms/clip, FPS ___.
 
 Error analysis checklist: the most confused word pairs (`*_top_confusions.csv`), why (similar handshape? same location? hand occluded?), accuracy per signer, accuracy versus hand-detection ratio.
@@ -500,7 +585,7 @@ For context only: the ASL Citizen paper reports about 63% accuracy over **all 2,
 
 ## 15. Limitations
 
-- **Little data per word** (about 15 training videos), so results can vary a lot between runs.
+- **Little data per word** (18–24 active training videos before feature-quality filtering), so results can vary a lot between runs.
 - **Isolated signs only**; you press a key to mark start and end. No continuous translation.
 - **Landmark errors** from poor light, motion blur, strong angles, hands covering the face or each other, or fast fingers.
 - **Domain gap:** dataset recording conditions differ from your own webcam setup.
